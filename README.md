@@ -4,7 +4,7 @@
 
 SideBar is a macOS menu bar utility that brings edge-snap and hover-reveal behavior to regular third-party app windows.
 
-The project is built around a cross-process window control model: instead of managing its own windows, it uses macOS Accessibility APIs to observe, reposition, hide, restore, and coordinate windows owned by other applications.
+The project is built around a cross-process window control model: instead of managing its own windows, it uses macOS Accessibility APIs to observe, reposition, hide, restore, 和 coordinate windows owned by other applications. Website：www.ivean.com/sidebar
 
 ### Overview
 
@@ -87,7 +87,7 @@ SideBar does not rely on ordinary AppKit ownership of the target windows. Instea
 - Avoids relying on `hide/unhide` as the primary animation path to reduce restore artifacts
 - Uses geometry locking and alpha fallback strategies to stabilize behavior on apps with aggressive window resizing logic
 - Handles focus transfer explicitly so Dock-driven and shortcut-driven flows behave consistently
-- Treats hover detection, collapse timing, and cleanup as first-class runtime concerns rather than UI-only behavior
+- Treats hover detection, collapse timing, 和 cleanup as first-class runtime concerns rather than UI-only behavior
 
 ### Requirements
 
@@ -132,7 +132,7 @@ swiftc -typecheck Sources/SideBar/*.swift \
 
 SideBar 是一个 macOS 菜单栏工具，为普通第三方应用窗口提供贴边吸附和悬停唤回的交互方式。
 
-这个项目围绕一套跨进程窗口控制模型构建：它不是只管理自己的窗口，而是通过 macOS 辅助功能 API 去观察、重新定位、隐藏、恢复并协调其他应用所拥有的窗口。
+这个项目围绕一套跨进程窗口控制模型构建：它不是只管理自己的窗口，而是通过 macOS 辅助功能 API 去观察、重新定位、隐藏、恢复并协调其他应用所拥有的窗口。网站：www.ivean.com/sidebar
 
 ### 概览
 
