@@ -125,3 +125,9 @@ swiftc -typecheck Sources/SideBar/*.swift \
 3. Grant Accessibility permission.
 4. Enable one or more regular GUI apps from the settings window.
 5. Test drag-to-edge, hover reveal, Dock activation, shortcuts, and multi-display behavior.
+
+## 中文补充
+
+SideBar 是一个面向 macOS 的菜单栏窗口管理工具，核心目标是把“贴边隐藏、悬停展开、快捷唤回”的交互方式扩展到普通第三方应用窗口，而不是只管理应用自身的窗口。
+
+这个仓库的技术重点主要集中在几件事上：跨进程窗口控制、辅助功能接口接入、边缘悬停传感、窗口状态机、多显示器边界处理、焦点交接，以及异常退出后的窗口恢复。如果你在研究 macOS 上如何可靠地控制外部应用窗口，这个项目会比较有参考价值。
