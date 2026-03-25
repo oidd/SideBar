@@ -85,16 +85,10 @@ struct SettingsView: View {
     private var modernLayout: some View {
         NavigationSplitView {
             List(selection: selectedTabBinding) {
-                ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general], id: \.self) { tab in
+                ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general, .about], id: \.self) { tab in
                     Label(tab.displayName, systemImage: tab.iconName)
                         .tag(tab)
                 }
-                
-                Divider()
-                    .listRowSeparator(.hidden)
-                
-                Label(SettingsTab.about.displayName, systemImage: SettingsTab.about.iconName)
-                    .tag(SettingsTab.about)
             }
             .listStyle(.sidebar)
             .navigationTitle("SideBar")
@@ -122,13 +116,9 @@ struct SettingsView: View {
                 
                 ScrollView {
                     VStack(spacing: 4) {
-                        ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general], id: \.self) { tab in
+                        ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general, .about], id: \.self) { tab in
                             LegacyTabButton(tab: tab, selectedTab: $selectedTab)
                         }
-                        
-                        Divider().padding(.vertical, 8).padding(.horizontal, 16)
-                        
-                        LegacyTabButton(tab: .about, selectedTab: $selectedTab)
                     }
                     .padding(.horizontal, 8)
                 }
