@@ -197,6 +197,7 @@ class WindowSession {
     private static let siblingWindowTransitionGraceInterval: TimeInterval = 0.22
     private static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
+    private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
 
     var onTemporaryShortcutSessionEnded: ((WindowSession, Bool, Bool) -> Void)?
     var onTemporaryShortcutStashStateChanged: ((WindowSession, Bool) -> Void)?
@@ -452,6 +453,10 @@ class WindowSession {
             return
         }
         if app.processIdentifier == self.pid {
+            if Self.shouldIgnoreProgrammaticActivation(for: self.pid) {
+                print("📱 忽略: 程序内部触发的激活，不展开窗口")
+                return
+            }
             if Date() < activationSuppressionUntil {
                 print("📱 忽略: 处于融合切换保护期")
                 return
@@ -473,6 +478,12 @@ class WindowSession {
             print("📱 应用激活通知: \(bundleID), 当前状态: \(state)")
             if case .snapped = state {
                 guard isFocusedWindowSession else {
+                    if shouldReleaseFinderDesktopActivation() {
+                        print("📱 Finder 桌面层激活，重新释放前台状态")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            Self.activateNonManagedApp()
+                        }
+                    }
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
                     return
                 }
@@ -861,9 +872,26 @@ class WindowSession {
         return unsafeBitCast(focusedWindowRef, to: AXUIElement.self)
     }
 
+    private func focusedWindowSubroleOfApp() -> String? {
+        guard let focusedWindow = focusedWindowOfApp() else { return nil }
+        var subroleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(focusedWindow, kAXSubroleAttribute as CFString, &subroleValue) == .success else {
+            return nil
+        }
+        return subroleValue as? String
+    }
+
     private func isCurrentFocusedWindowOfApp() -> Bool {
         guard let focusedWindow = focusedWindowOfApp() else { return false }
         return CFEqual(focusedWindow, windowElement)
+    }
+
+    private func shouldReleaseFinderDesktopActivation() -> Bool {
+        guard bundleID == "com.apple.finder" else { return false }
+        guard case .snapped = state else { return false }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+        guard let subrole = focusedWindowSubroleOfApp() else { return true }
+        return subrole != kAXStandardWindowSubrole
     }
 
     private func hasFocusedSiblingWindowOfApp() -> Bool {
@@ -1364,10 +1392,34 @@ class WindowSession {
             }
         }
         
-        // 3. 兜底方案：如果在屏幕可见窗口中没找到合适应用，则退而求其次激活 Finder
+        // 3. 空桌面兜底：优先交给 Dock 本身。
+        // Dock 没有可展开的标准窗口，既能释放当前前台状态，又不会把 Finder 的被管理窗口误拉出来。
+        if let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first,
+           dock.activate(options: []) {
+            return
+        }
+
+        // 4. 极端兜底：如果 Dock 无法接管，再退回 Finder，但忽略这次程序内部触发的激活。
         if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first {
+            registerProgrammaticActivationIgnore(for: finder.processIdentifier, duration: 0.45)
             finder.activate()
         }
+    }
+
+    private static func registerProgrammaticActivationIgnore(for pid: pid_t, duration: TimeInterval) {
+        cleanupProgrammaticActivationIgnores()
+        programmaticActivationIgnoreUntilByPID[pid] = Date().addingTimeInterval(duration)
+    }
+
+    private static func shouldIgnoreProgrammaticActivation(for pid: pid_t) -> Bool {
+        cleanupProgrammaticActivationIgnores()
+        guard let until = programmaticActivationIgnoreUntilByPID[pid] else { return false }
+        return until > Date()
+    }
+
+    private static func cleanupProgrammaticActivationIgnores() {
+        let now = Date()
+        programmaticActivationIgnoreUntilByPID = programmaticActivationIgnoreUntilByPID.filter { $0.value > now }
     }
     
     private func setupAXObserver() {
