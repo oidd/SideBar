@@ -11,12 +11,14 @@ struct AppSettings: Codable, Equatable {
     var isEnabled: Bool
     var colorName: String // e.g. "orange", "blue", "green"
     var opacity: Double? // 可选类型确保与旧本地存档的向后兼容
+    var snapSide: String? // both / left / right
     var shortcutModifiers: UInt? // NSEvent.ModifierFlags.rawValue
     var shortcutKeyCode: UInt16? // 键码
 }
 
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
+    private var temporaryDockMinimizeExcludedBundleIDs: Set<String> = []
     
     // Key: Bundle ID, Value: Config
     @Published var appSettings: [String: AppSettings] {
@@ -29,6 +31,12 @@ class AppConfig: ObservableObject {
     
     private let defaultsKey = "SideBarAppConfigurations"
     private let snapRecordsKey = "SideBarHiddenWindowRecords"
+    private let visualEffectEnabledKey = "SideBarVisualEffectEnabled"
+    private let fusionStripEnabledKey = "SideBarFusionStripEnabled"
+    private let fusionOverloadWarningShownKey = "SideBarFusionOverloadWarningShown"
+    private let mirrorPinEnabledKey = "SideBarMirrorPinEnabled"
+    private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
+    private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
     
     // 格式: "PID:WindowID"
     @Published var hiddenWindowRecords: [String] = [] {
@@ -57,6 +65,28 @@ class AppConfig: ObservableObject {
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
     }
+
+    @Published var temporaryShortcutModifiers: UInt? {
+        didSet {
+            if let temporaryShortcutModifiers {
+                UserDefaults.standard.set(temporaryShortcutModifiers, forKey: temporaryShortcutModifiersKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: temporaryShortcutModifiersKey)
+            }
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var temporaryShortcutKeyCode: UInt16? {
+        didSet {
+            if let temporaryShortcutKeyCode {
+                UserDefaults.standard.set(Int(temporaryShortcutKeyCode), forKey: temporaryShortcutKeyCodeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: temporaryShortcutKeyCodeKey)
+            }
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
     
     @Published var launchAtLogin: Bool = true {
         didSet {
@@ -68,6 +98,33 @@ class AppConfig: ObservableObject {
         didSet {
             UserDefaults.standard.set(showInMenuBar, forKey: "SideBarShowInMenuBar")
             NotificationCenter.default.post(name: .menuBarIconVisibilityChanged, object: nil)
+        }
+    }
+
+    @Published var isVisualEffectEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isVisualEffectEnabled, forKey: visualEffectEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var isFusionStripEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isFusionStripEnabled, forKey: fusionStripEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var hasShownFusionOverloadWarning: Bool = false {
+        didSet {
+            UserDefaults.standard.set(hasShownFusionOverloadWarning, forKey: fusionOverloadWarningShownKey)
+        }
+    }
+
+    @Published var isMirrorPinEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(isMirrorPinEnabled, forKey: mirrorPinEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
     }
     
@@ -87,6 +144,18 @@ class AppConfig: ObservableObject {
         self.hoverToleranceY = savedToleranceY > 0 ? savedToleranceY : 60
         
         self.hoverDelayMS = UserDefaults.standard.integer(forKey: "SideBarHoverDelayMS")
+
+        if UserDefaults.standard.object(forKey: temporaryShortcutModifiersKey) != nil {
+            self.temporaryShortcutModifiers = UInt(UserDefaults.standard.integer(forKey: temporaryShortcutModifiersKey))
+        } else {
+            self.temporaryShortcutModifiers = nil
+        }
+
+        if UserDefaults.standard.object(forKey: temporaryShortcutKeyCodeKey) != nil {
+            self.temporaryShortcutKeyCode = UInt16(UserDefaults.standard.integer(forKey: temporaryShortcutKeyCodeKey))
+        } else {
+            self.temporaryShortcutKeyCode = nil
+        }
         
         if UserDefaults.standard.object(forKey: "SideBarLaunchAtLogin") == nil {
             self.launchAtLogin = true
@@ -100,6 +169,29 @@ class AppConfig: ObservableObject {
             UserDefaults.standard.set(true, forKey: "SideBarShowInMenuBar")
         } else {
             self.showInMenuBar = UserDefaults.standard.bool(forKey: "SideBarShowInMenuBar")
+        }
+
+        if UserDefaults.standard.object(forKey: visualEffectEnabledKey) == nil {
+            self.isVisualEffectEnabled = true
+            UserDefaults.standard.set(true, forKey: visualEffectEnabledKey)
+        } else {
+            self.isVisualEffectEnabled = UserDefaults.standard.bool(forKey: visualEffectEnabledKey)
+        }
+
+        if UserDefaults.standard.object(forKey: fusionStripEnabledKey) == nil {
+            self.isFusionStripEnabled = true
+            UserDefaults.standard.set(true, forKey: fusionStripEnabledKey)
+        } else {
+            self.isFusionStripEnabled = UserDefaults.standard.bool(forKey: fusionStripEnabledKey)
+        }
+
+        self.hasShownFusionOverloadWarning = UserDefaults.standard.bool(forKey: fusionOverloadWarningShownKey)
+
+        if UserDefaults.standard.object(forKey: mirrorPinEnabledKey) == nil {
+            self.isMirrorPinEnabled = false
+            UserDefaults.standard.set(false, forKey: mirrorPinEnabledKey)
+        } else {
+            self.isMirrorPinEnabled = UserDefaults.standard.bool(forKey: mirrorPinEnabledKey)
         }
         
         if UserDefaults.standard.object(forKey: "SideBarLanguage") == nil {
@@ -119,7 +211,7 @@ class AppConfig: ObservableObject {
             let oldSet = UserDefaults.standard.stringArray(forKey: oldKey) ?? []
             var newDict: [String: AppSettings] = [:]
             for bundle in oldSet {
-                newDict[bundle] = AppSettings(isEnabled: true, colorName: "white")
+                newDict[bundle] = AppSettings(isEnabled: true, colorName: "white", snapSide: "both")
             }
             self.appSettings = newDict
         }
@@ -144,8 +236,10 @@ class AppConfig: ObservableObject {
     func setGlobalOpacity(_ opacity: Double) {
         var updated = appSettings
         for (key, var setting) in updated {
-            setting.opacity = opacity
-            updated[key] = setting
+            if setting.isEnabled {
+                setting.opacity = opacity
+                updated[key] = setting
+            }
         }
         appSettings = updated
     }
@@ -194,10 +288,21 @@ class AppConfig: ObservableObject {
     func getOpacity(for bundleID: String) -> Double {
         return appSettings[bundleID]?.opacity ?? 1.0
     }
+
+    func getSnapSide(for bundleID: String) -> String {
+        return appSettings[bundleID]?.snapSide ?? "both"
+    }
     
     func updateOpacity(bundleID: String, opacity: Double) {
         if var setting = appSettings[bundleID] {
             setting.opacity = opacity
+            appSettings[bundleID] = setting
+        }
+    }
+
+    func updateSnapSide(bundleID: String, snapSide: String) {
+        if var setting = appSettings[bundleID] {
+            setting.snapSide = snapSide
             appSettings[bundleID] = setting
         }
     }
@@ -208,6 +313,7 @@ class AppConfig: ObservableObject {
             isEnabled: isEnabled,
             colorName: colorName,
             opacity: existing?.opacity ?? 1.0,
+            snapSide: existing?.snapSide ?? "both",
             shortcutModifiers: existing?.shortcutModifiers,
             shortcutKeyCode: existing?.shortcutKeyCode
         )
@@ -219,6 +325,7 @@ class AppConfig: ObservableObject {
             isEnabled: isEnabled,
             colorName: existing?.colorName ?? "auto",
             opacity: existing?.opacity ?? 1.0,
+            snapSide: existing?.snapSide ?? "both",
             shortcutModifiers: existing?.shortcutModifiers,
             shortcutKeyCode: existing?.shortcutKeyCode
         )
@@ -238,6 +345,41 @@ class AppConfig: ObservableObject {
             setting.shortcutKeyCode = nil
             appSettings[bundleID] = setting
         }
+    }
+
+    func setTemporaryShortcut(modifiers: UInt, keyCode: UInt16) {
+        temporaryShortcutModifiers = modifiers
+        temporaryShortcutKeyCode = keyCode
+    }
+
+    func clearTemporaryShortcut() {
+        temporaryShortcutModifiers = nil
+        temporaryShortcutKeyCode = nil
+    }
+
+    func setTemporaryDockMinimizeExclusion(bundleID: String, excluded: Bool) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.setTemporaryDockMinimizeExclusion(bundleID: bundleID, excluded: excluded)
+            }
+            return
+        }
+
+        let changed: Bool
+        if excluded {
+            let (inserted, _) = temporaryDockMinimizeExcludedBundleIDs.insert(bundleID)
+            changed = inserted
+        } else {
+            changed = temporaryDockMinimizeExcludedBundleIDs.remove(bundleID) != nil
+        }
+
+        if changed {
+            syncManagedAppsToDockMinimize()
+        }
+    }
+
+    func markFusionOverloadWarningShown() {
+        hasShownFusionOverloadWarning = true
     }
     
     // MARK: - Hidden Window Recovery Support
@@ -262,6 +404,7 @@ class AppConfig: ObservableObject {
         let enabledBundleIDs = appSettings
             .filter { $0.value.isEnabled }
             .map { $0.key }
+        let mergedBundleIDs = Array(Set(enabledBundleIDs).union(temporaryDockMinimizeExcludedBundleIDs)).sorted()
         
         // 2. 确保共享目录存在
         let sharedDir = FileManager.default.homeDirectoryForCurrentUser
@@ -277,7 +420,7 @@ class AppConfig: ObservableObject {
         // 3. 写入 JSON 文件
         let filePath = sharedDir.appendingPathComponent("sidebar_managed_apps.json")
         do {
-            let data = try JSONSerialization.data(withJSONObject: enabledBundleIDs, options: .prettyPrinted)
+            let data = try JSONSerialization.data(withJSONObject: mergedBundleIDs, options: .prettyPrinted)
             try data.write(to: filePath, options: .atomic)
         } catch {
             print("[SideBar] 写入共享文件失败: \(error)")

@@ -3,6 +3,9 @@ import ApplicationServices
 
 class AXWindowManager {
     private var sessions: [WindowSession] = []
+    private let fusionCoordinator = FusionStripCoordinator()
+    private var temporaryShortcutSession: WindowSession?
+    private var temporarilyExcludedWindowKeys: Set<String> = []
     
     // 监听应用级别的通知 (如焦点窗口变化)，跟踪新建的窗口
     private var appObservers: [pid_t: (AXObserver, CFRunLoopSource)] = [:]
@@ -10,6 +13,7 @@ class AXWindowManager {
     private var globalMouseUpMonitor: Any?
     private var localMouseUpMonitor: Any?
     private var globalKeyDownMonitor: Any?
+    private var fusionRefreshTimer: Timer?
     
     init() {
         startMonitoringAppActivation()
@@ -24,6 +28,11 @@ class AXWindowManager {
         
         // 启动时同步一次所有运行中应用
         synchronizeSessions()
+
+        fusionRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.fusionCoordinator.reconcile(sessions: self.sessions)
+        }
         
         // 低频轮询（每 5 秒）：检测被管理应用是否已退出，自动清理残留 session
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
@@ -50,7 +59,7 @@ class AXWindowManager {
         
         // 1. 下线不再被允许的会话及过期的应用级监听
         sessions.removeAll { session in
-            if !AppConfig.shared.isAppEnabled(bundleID: session.bundleID) {
+            if !AppConfig.shared.isAppEnabled(bundleID: session.bundleID) && !session.isManagedByTemporaryShortcut {
                 print("🗑️ 配置变更，移除已停用会话: \(session.bundleID)")
                 session.restoreAndDestroy()
                 return true
@@ -86,6 +95,8 @@ class AXWindowManager {
                 monitorApp(pid: app.processIdentifier, bundleID: bundleID, maxRetries: 1)
             }
         }
+
+        fusionCoordinator.reconcile(sessions: sessions)
     }
     
     @objc private func appDidActivate(_ notification: Notification) {
@@ -108,6 +119,9 @@ class AXWindowManager {
             session.restoreAndDestroy()
         }
         sessions.removeAll()
+        fusionCoordinator.tearDownAll()
+        fusionRefreshTimer?.invalidate()
+        fusionRefreshTimer = nil
         
         for (_, info) in appObservers {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
@@ -164,11 +178,17 @@ class AXWindowManager {
                 // 如果拿不到子角色，保险起见也跳过
                 return
             }
+
+            if let windowKey = windowKey(for: windowElement, pid: pid),
+               temporarilyExcludedWindowKeys.contains(windowKey) {
+                return
+            }
             
             // 检查缓存池中是否已存在这个窗口的会话
             if !sessions.contains(where: { CFEqual($0.windowElement, windowElement) }) {
                 print("🆕 为新标准窗口创建 WindowSession (Bundle: \(bundleID), PID: \(pid))")
                 let session = WindowSession(appElement: appElement, windowElement: windowElement, pid: pid, bundleID: bundleID)
+                attachTemporaryShortcutLifecycle(to: session)
                 sessions.append(session)
             }
         } else if maxRetries > 0 {
@@ -185,6 +205,8 @@ class AXWindowManager {
             let result = AXUIElementCopyAttributeValue(session.windowElement, kAXRoleAttribute as CFString, &roleValue)
             return result == .invalidUIElement || result == .cannotComplete
         }
+
+        fusionCoordinator.reconcile(sessions: sessions)
     }
     
     private func setupGlobalMouseMonitor() {
@@ -221,6 +243,13 @@ class AXWindowManager {
         let keyCode = event.keyCode
         // 只关心修饰键中的四大标志位
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+
+        if let temporaryModifiers = AppConfig.shared.temporaryShortcutModifiers,
+           let temporaryKeyCode = AppConfig.shared.temporaryShortcutKeyCode,
+           keyCode == temporaryKeyCode,
+           modifiers == temporaryModifiers {
+            return handleTemporaryShortcut()
+        }
         
         // 遍历所有已启用应用的配置寻找匹配的快捷键
         for (bundleID, settings) in AppConfig.shared.appSettings {
@@ -238,5 +267,98 @@ class AXWindowManager {
             }
         }
         return false
+    }
+
+    private func handleTemporaryShortcut() -> Bool {
+        if let temporaryShortcutSession {
+            print("⌨️ 临时折叠快捷键触发 -> 切换现有临时窗口")
+            temporaryShortcutSession.toggleTemporaryShortcutStash()
+            return true
+        }
+
+        guard let target = currentFocusedStandardWindow() else { return false }
+        clearTemporarilyExcludedWindow(for: target.windowElement, pid: target.pid)
+
+        let session: WindowSession
+        if let existingSession = sessions.first(where: { CFEqual($0.windowElement, target.windowElement) }) {
+            session = existingSession
+        } else {
+            let createdSession = WindowSession(
+                appElement: target.appElement,
+                windowElement: target.windowElement,
+                pid: target.pid,
+                bundleID: target.bundleID
+            )
+            attachTemporaryShortcutLifecycle(to: createdSession)
+            sessions.append(createdSession)
+            session = createdSession
+        }
+
+        session.enableTemporaryShortcutManagement()
+        temporaryShortcutSession = session
+        fusionCoordinator.reconcile(sessions: sessions)
+        print("⌨️ 临时折叠快捷键触发 -> \(target.bundleID)")
+        session.toggleTemporaryShortcutStash()
+        return true
+    }
+
+    private func currentFocusedStandardWindow() -> (appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String)? {
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
+              frontmostApp.activationPolicy == .regular,
+              frontmostApp.bundleIdentifier != Bundle.main.bundleIdentifier,
+              let bundleID = frontmostApp.bundleIdentifier else {
+            return nil
+        }
+
+        let pid = frontmostApp.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue) == .success,
+              let focusedWindow = windowValue else {
+            return nil
+        }
+
+        let windowElement = focusedWindow as! AXUIElement
+        var subroleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(windowElement, kAXSubroleAttribute as CFString, &subroleValue) == .success,
+              let subrole = subroleValue as? String,
+              subrole == kAXStandardWindowSubrole else {
+            return nil
+        }
+
+        return (appElement, windowElement, pid, bundleID)
+    }
+
+    private func attachTemporaryShortcutLifecycle(to session: WindowSession) {
+        session.onTemporaryShortcutSessionEnded = { [weak self] session, excludeWindow, removeSession in
+            self?.handleTemporaryShortcutSessionEnded(session, excludeWindow: excludeWindow, removeSession: removeSession)
+        }
+    }
+
+    private func handleTemporaryShortcutSessionEnded(_ session: WindowSession, excludeWindow: Bool, removeSession: Bool) {
+        if excludeWindow, let windowKey = windowKey(for: session.windowElement, pid: session.pid) {
+            temporarilyExcludedWindowKeys.insert(windowKey)
+        }
+        if temporaryShortcutSession === session {
+            temporaryShortcutSession = nil
+        }
+
+        guard removeSession else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sessions.removeAll { $0 === session }
+            self.fusionCoordinator.reconcile(sessions: self.sessions)
+        }
+    }
+
+    private func clearTemporarilyExcludedWindow(for windowElement: AXUIElement, pid: pid_t) {
+        guard let windowKey = windowKey(for: windowElement, pid: pid) else { return }
+        temporarilyExcludedWindowKeys.remove(windowKey)
+    }
+
+    private func windowKey(for windowElement: AXUIElement, pid: pid_t) -> String? {
+        guard let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) else { return nil }
+        return "\(pid):\(windowID)"
     }
 }

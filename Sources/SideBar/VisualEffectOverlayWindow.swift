@@ -280,7 +280,7 @@ class VisualEffectOverlayWindow: NSPanel {
         self.orderFront(nil)
     }
     
-    func stopExpandEffect(closeWindow: Bool = true) {
+    func stopExpandEffect(closeWindow: Bool = true, immediate: Bool = false) {
         cleanupWorkItem?.cancel()
         cleanupWorkItem = nil
         
@@ -289,6 +289,15 @@ class VisualEffectOverlayWindow: NSPanel {
         
         self.beamLayer = nil
         self.dustLayer = nil
+
+        if immediate {
+            beamToRemove?.removeFromSuperlayer()
+            dustToRemove?.removeFromSuperlayer()
+            if closeWindow {
+                self.orderOut(nil)
+            }
+            return
+        }
         
         if let beam = beamToRemove {
             let beamFade = CABasicAnimation(keyPath: "opacity")
