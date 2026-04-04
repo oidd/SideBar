@@ -164,9 +164,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             print("辅助功能权限正常")
             axManager = AXWindowManager()
-            
-            // 为了避免用户觉得“没有反应”，鉴权通过后主动弹出一次设置主界面
-            showSettings()
         }
     }
     
