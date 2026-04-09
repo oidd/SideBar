@@ -662,10 +662,7 @@ private let opacityOptions: [Double] = Array(0...10).map { Double($0) / 10.0 }
 private let snapSideKeys: [String] = [
     "left",
     "right",
-    "bottom",
-    "leftRight",
-    "leftBottom",
-    "rightBottom"
+    "leftRight"
 ]
 
 private func opacityDisplay(_ value: Double) -> String {
@@ -678,12 +675,6 @@ private func snapSideDisplay(_ key: String) -> String {
         return "仅左侧".localized
     case "right":
         return "仅右侧".localized
-    case "bottom":
-        return "仅底部".localized
-    case "leftBottom":
-        return "左侧和底部".localized
-    case "rightBottom":
-        return "右侧和底部".localized
     default:
         return "左侧和右侧".localized
     }
@@ -695,14 +686,6 @@ private func snapSideEdges(_ key: String) -> Set<String> {
         return ["left"]
     case "right":
         return ["right"]
-    case "bottom":
-        return ["bottom"]
-    case "leftBottom":
-        return ["left", "bottom"]
-    case "rightBottom":
-        return ["right", "bottom"]
-    case "leftRightBottom":
-        return ["left", "right", "bottom"]
     default:
         return ["left", "right"]
     }
@@ -723,8 +706,6 @@ private func snapSideBlockedMessage(for key: String, blockedDockSide: String?) -
         return "左侧被程序坞占据，涉及左侧的快照条不会生效".localized
     case "right":
         return "右侧被程序坞占据，涉及右侧的快照条不会生效".localized
-    case "bottom":
-        return "底部被程序坞占据，涉及底部的快照条不会生效".localized
     default:
         return nil
     }
@@ -944,13 +925,6 @@ private func makeSnapSideMenuImage(
         )
     }
 
-    if activeEdges.contains("bottom") {
-        strokeEdge(
-            from: NSPoint(x: rect.minX + edgeInset, y: rect.minY),
-            to: NSPoint(x: rect.maxX - edgeInset, y: rect.minY)
-        )
-    }
-    
     image.unlockFocus()
     image.isTemplate = false
     return image
@@ -2150,7 +2124,7 @@ struct AppearanceSettingsView: View {
                                             .font(.system(size: 11, weight: .semibold))
                                             .foregroundColor(.secondary)
                                             .lineLimit(1)
-                                        HeaderHelpButton(message: "吸附侧用于限制窗口只在指定屏幕边缘触发吸附。你可以组合左侧、右侧与底部；若某一侧被程序坞占据，则该侧相关组合会被禁用，并在下方显示提醒。".localized)
+                                        HeaderHelpButton(message: "吸附侧用于限制窗口只在指定屏幕边缘触发吸附。你可以组合左侧与右侧；若某一侧被程序坞占据，则该侧相关组合会被禁用，并在下方显示提醒。".localized)
                                     }
                                     .padding(.leading, menuFieldTextLeadingInset)
                                     .frame(width: appearanceSnapColumnWidth, alignment: .leading)

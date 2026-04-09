@@ -4,7 +4,6 @@ import QuartzCore
 enum SnapEdge {
     case left
     case right
-    case bottom
 }
 
 class VisualEffectOverlayWindow: NSPanel {
@@ -49,8 +48,8 @@ class VisualEffectOverlayWindow: NSPanel {
         
         let emitter = CAEmitterLayer()
         emitter.emitterPosition = localPoint
-        emitter.emitterShape = edge == .bottom ? .line : .line
-        emitter.emitterSize = edge == .bottom ? CGSize(width: 40, height: 10) : CGSize(width: 10, height: 40)
+        emitter.emitterShape = .line
+        emitter.emitterSize = CGSize(width: 10, height: 40)
         emitter.renderMode = .additive
         
         let cell = CAEmitterCell()
@@ -62,14 +61,10 @@ class VisualEffectOverlayWindow: NSPanel {
             cell.emissionLongitude = 0
             cell.emissionRange = .pi / 4
             cell.yAcceleration = 400
-        } else if edge == .right {
+        } else {
             cell.emissionLongitude = .pi
             cell.emissionRange = .pi / 4
             cell.yAcceleration = 400
-        } else {
-            cell.emissionLongitude = .pi / 2
-            cell.emissionRange = .pi / 5
-            cell.yAcceleration = -120
         }
         cell.scale = 0.5
         cell.scaleRange = 0.2

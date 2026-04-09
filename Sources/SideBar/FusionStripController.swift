@@ -171,6 +171,7 @@ final class FusionStripCoordinator {
 
     private func handleHoveredSessionChange(_ sessionID: ObjectIdentifier?, for key: FusionGroupKey) {
         switchVersions[key, default: 0] += 1
+        let version = switchVersions[key, default: 0]
         hoveredSessionIDs[key] = sessionID
         hoverTimers[key]?.invalidate()
         hoverTimers.removeValue(forKey: key)
@@ -194,10 +195,10 @@ final class FusionStripCoordinator {
         }
 
         if delay <= 0 {
-            activateSession(sessionID, in: key)
+            activateSession(sessionID, in: key, expectedVersion: version)
         } else {
             let timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                self?.activateSession(sessionID, in: key)
+                self?.activateSession(sessionID, in: key, expectedVersion: version)
             }
             hoverTimers[key] = timer
         }
@@ -205,8 +206,11 @@ final class FusionStripCoordinator {
         refreshOverlay(for: key)
     }
 
-    private func activateSession(_ sessionID: ObjectIdentifier, in key: FusionGroupKey) {
+    private func activateSession(_ sessionID: ObjectIdentifier, in key: FusionGroupKey, expectedVersion: Int? = nil) {
         guard var model = models[key] else { return }
+        if let expectedVersion, switchVersions[key, default: 0] != expectedVersion { return }
+        guard hoverInsideTrack[key] == true else { return }
+        guard hoveredSessionIDs[key] == sessionID else { return }
         if sessionLookup[sessionID]?.isTemporaryPinnedForFusion() == true {
             refreshOverlay(for: key)
             return
@@ -656,7 +660,6 @@ private final class FusionIndicatorContentView: NSView {
         let sideMargin: CGFloat = 10
         let labelHorizontalPadding: CGFloat = 9
         let labelHeight: CGFloat = 20
-        let centerY = segment.slotRect.midY
         let labelFont = NSFont.systemFont(ofSize: 12.5, weight: hoveredSessionID == segment.sessionID ? .semibold : .medium)
 
         let style = NSMutableParagraphStyle()
@@ -671,6 +674,8 @@ private final class FusionIndicatorContentView: NSView {
         ]
         let rawLabelWidth = ceil((segment.title as NSString).size(withAttributes: attributes).width) + labelHorizontalPadding * 2
         let labelWidth = min(max(rawLabelWidth, 54), 104)
+
+        let centerY = segment.slotRect.midY
         let stackHeight = iconSize + stackGap + labelHeight
         let stackOriginY = centerY - stackHeight / 2
         let stackCenterX: CGFloat

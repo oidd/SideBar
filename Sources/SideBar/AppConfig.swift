@@ -11,7 +11,7 @@ struct AppSettings: Codable, Equatable {
     var isEnabled: Bool
     var colorName: String // e.g. "orange", "blue", "green"
     var opacity: Double? // 可选类型确保与旧本地存档的向后兼容
-    var snapSide: String? // left / right / bottom / leftRight / leftBottom / rightBottom / leftRightBottom
+    var snapSide: String? // left / right / leftRight
     var shortcutModifiers: UInt? // NSEvent.ModifierFlags.rawValue
     var shortcutKeyCode: UInt16? // 键码
 }
@@ -500,9 +500,9 @@ class AppConfig: ObservableObject {
         switch rawValue {
         case "both", "leftRight":
             return "leftRight"
-        case "left", "right", "bottom", "leftBottom", "rightBottom":
+        case "left", "right":
             return rawValue ?? "leftRight"
-        case "leftRightBottom":
+        case "bottom", "leftBottom", "rightBottom", "leftRightBottom":
             return "leftRight"
         default:
             return "leftRight"
