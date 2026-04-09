@@ -47,14 +47,6 @@ struct SettingsView: View {
         return longestTitle >= 16 ? 252 : 208
     }
     
-    private var minimumWindowWidth: CGFloat {
-        sidebarIdealWidth + 580
-    }
-    
-    private var idealWindowWidth: CGFloat {
-        sidebarIdealWidth + 640
-    }
-    
     // MARK: - 右侧内容视图
     @ViewBuilder
     private var detailContent: some View {
@@ -109,7 +101,7 @@ struct SettingsView: View {
             }
             .background(Color(NSColor.controlBackgroundColor).ignoresSafeArea())
         }
-        .frame(minWidth: minimumWindowWidth, idealWidth: idealWindowWidth, minHeight: 580, idealHeight: 580)
+        .frame(minHeight: 580, idealHeight: 580)
         .id(config.language)
     }
     
@@ -129,7 +121,7 @@ struct SettingsView: View {
             }
             .background(Color(NSColor.controlBackgroundColor).ignoresSafeArea())
         }
-        .frame(minWidth: minimumWindowWidth, idealWidth: idealWindowWidth, minHeight: 580, idealHeight: 580)
+        .frame(minHeight: 580, idealHeight: 580)
         .id(config.language)
     }
 }
@@ -2880,7 +2872,7 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.1"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

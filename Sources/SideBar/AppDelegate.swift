@@ -125,7 +125,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isMovableByWindowBackground = true
-            window.minSize = NSSize(width: 820, height: 580)
+            // Keep the actual window visually fixed at its default size, but lower the minimum
+            // width constraint so NavigationSplitView has more room to resolve collapse/expand.
+            window.minSize = NSSize(width: 640, height: 580)
             window.standardWindowButton(.zoomButton)?.isHidden = true
             window.contentView = NSHostingView(rootView: settingsView)
             window.isReleasedWhenClosed = false
