@@ -39,13 +39,20 @@ struct SettingsView: View {
     @StateObject private var appListManager = AppListManager()
     @StateObject private var config = AppConfig.shared
     @State private var selectedTab: SettingsTab = .apps
+
+    private let sidebarTabs: [SettingsTab] = [.apps, .appearance, .shortcuts, .interaction, .general, .advanced, .about]
     
-    // NavigationSplitView 的 List(selection:) 需要 Optional 绑定
-    private var selectedTabBinding: Binding<SettingsTab?> {
-        Binding<SettingsTab?>(
-            get: { selectedTab },
-            set: { if let newValue = $0 { selectedTab = newValue } }
-        )
+    private var sidebarIdealWidth: CGFloat {
+        let longestTitle = sidebarTabs.map(\.displayName).map(\.count).max() ?? 0
+        return longestTitle >= 16 ? 252 : 208
+    }
+    
+    private var minimumWindowWidth: CGFloat {
+        sidebarIdealWidth + 580
+    }
+    
+    private var idealWindowWidth: CGFloat {
+        sidebarIdealWidth + 640
     }
     
     // MARK: - 右侧内容视图
@@ -85,86 +92,254 @@ struct SettingsView: View {
         }
     }
     
-    // MARK: - macOS 13+ 原生 NavigationSplitView 布局
     @available(macOS 13.0, *)
     private var modernLayout: some View {
         NavigationSplitView {
-            List(selection: selectedTabBinding) {
-                ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general, .advanced, .about], id: \.self) { tab in
-                    Label(tab.displayName, systemImage: tab.iconName)
-                        .tag(tab)
-                }
-            }
-            .listStyle(.sidebar)
+            SettingsSidebar(
+                tabs: sidebarTabs,
+                selectedTab: $selectedTab,
+                showsEmbeddedTitle: false
+            )
             .navigationTitle("SideBar")
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 220)
+            .navigationSplitViewColumnWidth(min: sidebarIdealWidth, ideal: sidebarIdealWidth, max: sidebarIdealWidth + 24)
         } detail: {
-            // GeometryReader 约束 detail 内容高度，防止内容撑大后推动整个分栏上移
             GeometryReader { geo in
                 detailContent
                     .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
             }
+            .background(Color(NSColor.controlBackgroundColor).ignoresSafeArea())
         }
-        .frame(width: 860, height: 560)
+        .frame(minWidth: minimumWindowWidth, idealWidth: idealWindowWidth, minHeight: 580, idealHeight: 580)
         .id(config.language)
     }
     
-    // MARK: - macOS 12 降级布局（保留原有手动布局）
     private var legacyLayout: some View {
         HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text("SideBar")
-                    .font(.system(size: 20, weight: .bold))
-                    .padding(.horizontal, 16)
-                    .padding(.top, 20)
-                    .padding(.bottom, 15)
-                
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach([SettingsTab.apps, .appearance, .shortcuts, .interaction, .general, .advanced, .about], id: \.self) { tab in
-                            LegacyTabButton(tab: tab, selectedTab: $selectedTab)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                }
-            }
-            .frame(width: 180)
-            .background(Color(NSColor.windowBackgroundColor))
+            SettingsSidebar(
+                tabs: sidebarTabs,
+                selectedTab: $selectedTab,
+                showsEmbeddedTitle: true
+            )
             
             Divider()
             
-            detailContent
-                .background(Color(NSColor.controlBackgroundColor).ignoresSafeArea())
+            GeometryReader { geo in
+                detailContent
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            }
+            .background(Color(NSColor.controlBackgroundColor).ignoresSafeArea())
         }
-        .frame(width: 840, height: 560)
+        .frame(minWidth: minimumWindowWidth, idealWidth: idealWindowWidth, minHeight: 580, idealHeight: 580)
+        .id(config.language)
     }
 }
 
 
-// MARK: - macOS 12 降级侧边栏按钮
-struct LegacyTabButton: View {
+struct SettingsSidebar: View {
+    let tabs: [SettingsTab]
+    @Binding var selectedTab: SettingsTab
+    let showsEmbeddedTitle: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showsEmbeddedTitle {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("SideBar")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                }
+                .padding(.leading, 32)
+                .padding(.trailing, 18)
+                .padding(.top, 22)
+                .padding(.bottom, 16)
+            }
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 8) {
+                    ForEach(tabs, id: \.self) { tab in
+                        SettingsSidebarItem(
+                            tab: tab,
+                            selectedTab: $selectedTab
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.top, showsEmbeddedTitle ? 0 : 10)
+                .padding(.bottom, 18)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+struct SettingsSidebarItem: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
     let tab: SettingsTab
     @Binding var selectedTab: SettingsTab
+
+    @State private var isHovered = false
+
+    private var isSelected: Bool {
+        selectedTab == tab
+    }
+
+    private var transitionAnimation: Animation {
+        reduceMotion
+            ? .easeOut(duration: 0.12)
+            : .spring(response: 0.26, dampingFraction: 0.84, blendDuration: 0.14)
+    }
+
+    private var activeBlue: Color {
+        Color(nsColor: .systemBlue)
+    }
+
+    private var hoverGray: Color {
+        colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.16)
+    }
+
+    private var hoverWash: Color {
+        colorScheme == .dark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
+    }
+
+    private var beamLeadingInset: CGFloat { 18 }
+    private var rowCornerRadius: CGFloat { 8 }
     
+    private var selectedBeamAnimation: Animation? {
+        isSelected ? transitionAnimation : nil
+    }
+
     var body: some View {
-        Button(action: { selectedTab = tab }) {
-            HStack(spacing: 10) {
-                Image(systemName: tab.iconName)
-                    .font(.system(size: 14, weight: .medium))
-                    .frame(width: 20)
-                Text(tab.displayName)
-                    .font(.system(size: 13))
-                Spacer()
+        Button {
+            withAnimation(transitionAnimation) {
+                selectedTab = tab
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .background(selectedTab == tab ? Color.blue : Color.clear)
-            .foregroundColor(selectedTab == tab ? .white : .primary)
-            .cornerRadius(8)
+        } label: {
+            ZStack(alignment: .leading) {
+                GeometryReader { proxy in
+                    let beamWidth = max(proxy.size.width - beamLeadingInset, 0)
+
+                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+                        .fill(hoverWash)
+                        .frame(width: isHovered && !isSelected ? beamWidth : 0, height: proxy.size.height)
+                        .offset(x: beamLeadingInset)
+                        .animation(transitionAnimation, value: isHovered)
+                        .animation(transitionAnimation, value: isSelected)
+
+                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    activeBlue.opacity(colorScheme == .dark ? 0.20 : 0.15),
+                                    activeBlue.opacity(colorScheme == .dark ? 0.10 : 0.04)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .shadow(color: activeBlue.opacity(0.12), radius: 8, x: 0, y: 0)
+                        .frame(width: isSelected ? beamWidth : 0, height: proxy.size.height)
+                        .offset(x: beamLeadingInset)
+                        .animation(selectedBeamAnimation, value: isSelected)
+                }
+                .allowsHitTesting(false)
+
+                HStack(spacing: 12) {
+                    SettingsTabIcon(tab: tab, isSelected: isSelected, isHovered: isHovered)
+
+                    Text(tab.displayName)
+                        .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 20)
+                .padding(.trailing, 10)
+                .padding(.vertical, 11)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Capsule(style: .continuous)
+                    .fill(isSelected ? activeBlue : hoverGray)
+                    .frame(width: isSelected ? 4 : 3, height: isSelected ? 34 : 22)
+                    .opacity(isSelected || isHovered ? 1 : 0)
+                    .padding(.leading, 8)
+                    .shadow(color: isSelected ? activeBlue.opacity(0.18) : .clear, radius: 6, x: 0, y: 0)
+                    .animation(selectedBeamAnimation, value: isSelected)
+                    .animation(transitionAnimation, value: isHovered)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .accessibilityLabel(tab.displayName)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+struct SettingsTabIcon: View {
+    let tab: SettingsTab
+    let isSelected: Bool
+    let isHovered: Bool
+
+    private var tint: Color {
+        if isSelected {
+            return Color(nsColor: .systemBlue)
+        }
+        if isHovered {
+            return .primary.opacity(0.85)
+        }
+        return .secondary
+    }
+
+    var body: some View {
+        Group {
+            if tab == .appearance {
+                SnapshotBarStyleGlyph(tint: tint, isSelected: isSelected)
+            } else {
+                Image(systemName: tab.iconName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 20, height: 20)
+            }
+        }
+        .frame(width: 22, height: 20, alignment: .center)
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+}
+
+struct SnapshotBarStyleGlyph: View {
+    let tint: Color
+    let isSelected: Bool
+
+    private var barOpacity: Double {
+        isSelected ? 1.0 : 0.78
+    }
+
+    private var blockOpacity: Double {
+        isSelected ? 0.18 : 0.10
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(tint.opacity(barOpacity))
+                .frame(width: 4, height: 16)
+
+            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                .fill(tint.opacity(blockOpacity))
+                .frame(width: 13, height: 16)
+                .offset(x: 6)
+        }
+        .frame(width: 18, height: 18, alignment: .leading)
     }
 }
 

@@ -115,7 +115,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settingsWindow == nil {
             let settingsView = SettingsView()
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                contentRect: NSRect(x: 0, y: 0, width: 900, height: 580),
                 styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
@@ -125,12 +125,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isMovableByWindowBackground = true
+            window.minSize = NSSize(width: 820, height: 580)
             window.standardWindowButton(.zoomButton)?.isHidden = true
             window.contentView = NSHostingView(rootView: settingsView)
             window.isReleasedWhenClosed = false
-            
-            // 隐藏 NavigationSplitView 自带的 sidebar toggle 工具栏按钮
-            window.toolbar?.isVisible = false
             
             settingsWindow = window
         }
