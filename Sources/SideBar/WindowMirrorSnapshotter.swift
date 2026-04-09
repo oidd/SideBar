@@ -20,8 +20,12 @@ final class WindowMirrorSnapshotter {
 
     private init() {}
 
+    func captureBounds(for bounds: CGRect) -> CGRect {
+        bounds.insetBy(dx: -shadowPadding, dy: -shadowPadding)
+    }
+
     func snapshot(windowID: CGWindowID, bounds: CGRect) -> WindowMirrorSnapshot? {
-        let captureBounds = bounds.insetBy(dx: -shadowPadding, dy: -shadowPadding)
+        let captureBounds = captureBounds(for: bounds)
         let imageRef = _CGWindowListCreateImage(
             captureBounds,
             CGWindowListOption.optionIncludingWindow.rawValue,

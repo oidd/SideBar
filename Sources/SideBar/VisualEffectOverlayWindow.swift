@@ -4,6 +4,7 @@ import QuartzCore
 enum SnapEdge {
     case left
     case right
+    case bottom
 }
 
 class VisualEffectOverlayWindow: NSPanel {
@@ -48,8 +49,8 @@ class VisualEffectOverlayWindow: NSPanel {
         
         let emitter = CAEmitterLayer()
         emitter.emitterPosition = localPoint
-        emitter.emitterShape = .line
-        emitter.emitterSize = CGSize(width: 10, height: 40)
+        emitter.emitterShape = edge == .bottom ? .line : .line
+        emitter.emitterSize = edge == .bottom ? CGSize(width: 40, height: 10) : CGSize(width: 10, height: 40)
         emitter.renderMode = .additive
         
         let cell = CAEmitterCell()
@@ -57,9 +58,19 @@ class VisualEffectOverlayWindow: NSPanel {
         cell.lifetime = 1.5
         cell.velocity = 150
         cell.velocityRange = 50
-        cell.emissionLongitude = (edge == .left) ? 0 : .pi 
-        cell.emissionRange = .pi / 4
-        cell.yAcceleration = 400 
+        if edge == .left {
+            cell.emissionLongitude = 0
+            cell.emissionRange = .pi / 4
+            cell.yAcceleration = 400
+        } else if edge == .right {
+            cell.emissionLongitude = .pi
+            cell.emissionRange = .pi / 4
+            cell.yAcceleration = 400
+        } else {
+            cell.emissionLongitude = .pi / 2
+            cell.emissionRange = .pi / 5
+            cell.yAcceleration = -120
+        }
         cell.scale = 0.5
         cell.scaleRange = 0.2
         cell.scaleSpeed = -0.2
@@ -126,11 +137,15 @@ class VisualEffectOverlayWindow: NSPanel {
             beamRect = CGRect(x: 0, y: localTargetFrame.minY - flareAmt, width: beamLength, height: localTargetFrame.height + flareAmt * 2)
             beamContent.startPoint = CGPoint(x: 0, y: 0.5)
             beamContent.endPoint = CGPoint(x: 1, y: 0.5)
-        } else {
+        } else if edge == .right {
             // 核心修复：锚定到屏幕物理右边缘
             beamRect = CGRect(x: screenFrame.width - beamLength, y: localTargetFrame.minY - flareAmt, width: beamLength, height: localTargetFrame.height + flareAmt * 2)
             beamContent.startPoint = CGPoint(x: 1, y: 0.5)
             beamContent.endPoint = CGPoint(x: 0, y: 0.5)
+        } else {
+            beamRect = CGRect(x: localTargetFrame.minX - flareAmt, y: 0, width: localTargetFrame.width + flareAmt * 2, height: beamLength)
+            beamContent.startPoint = CGPoint(x: 0.5, y: 0)
+            beamContent.endPoint = CGPoint(x: 0.5, y: 1)
         }
         
         beamContent.frame = beamRect
@@ -144,11 +159,16 @@ class VisualEffectOverlayWindow: NSPanel {
             path.addLine(to: CGPoint(x: br.width, y: 0)) 
             path.addLine(to: CGPoint(x: br.width, y: br.height)) 
             path.addLine(to: CGPoint(x: 0, y: br.height - flareAmt)) 
-        } else {
+        } else if edge == .right {
             path.move(to: CGPoint(x: br.width, y: flareAmt))
             path.addLine(to: CGPoint(x: 0, y: 0))
             path.addLine(to: CGPoint(x: 0, y: br.height))
             path.addLine(to: CGPoint(x: br.width, y: br.height - flareAmt))
+        } else {
+            path.move(to: CGPoint(x: flareAmt, y: 0))
+            path.addLine(to: CGPoint(x: br.width - flareAmt, y: 0))
+            path.addLine(to: CGPoint(x: br.width, y: br.height))
+            path.addLine(to: CGPoint(x: 0, y: br.height))
         }
         path.closeSubpath()
         shapeMask.path = path
@@ -178,8 +198,16 @@ class VisualEffectOverlayWindow: NSPanel {
                 NSColor.white.withAlphaComponent(0.0).cgColor
             ]
             line.locations = [0.0, 0.4, 0.8] 
-            line.startPoint = (edge == .left) ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 1, y: 0.5)
-            line.endPoint = (edge == .left) ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0, y: 0.5)
+            if edge == .left {
+                line.startPoint = CGPoint(x: 0, y: 0.5)
+                line.endPoint = CGPoint(x: 1, y: 0.5)
+            } else if edge == .right {
+                line.startPoint = CGPoint(x: 1, y: 0.5)
+                line.endPoint = CGPoint(x: 0, y: 0.5)
+            } else {
+                line.startPoint = CGPoint(x: 0.5, y: 0)
+                line.endPoint = CGPoint(x: 0.5, y: 1)
+            }
             
             let dx = end.x - start.x
             let dy = end.y - start.y
@@ -197,9 +225,12 @@ class VisualEffectOverlayWindow: NSPanel {
         if edge == .left {
             addBorderLine(from: CGPoint(x: 0, y: flareAmt), to: CGPoint(x: brBounds.width, y: 0))
             addBorderLine(from: CGPoint(x: 0, y: brBounds.height - flareAmt), to: CGPoint(x: brBounds.width, y: brBounds.height))
-        } else {
+        } else if edge == .right {
             addBorderLine(from: CGPoint(x: brBounds.width, y: flareAmt), to: CGPoint(x: 0, y: 0))
             addBorderLine(from: CGPoint(x: brBounds.width, y: brBounds.height - flareAmt), to: CGPoint(x: 0, y: brBounds.height))
+        } else {
+            addBorderLine(from: CGPoint(x: flareAmt, y: 0), to: CGPoint(x: 0, y: brBounds.height))
+            addBorderLine(from: CGPoint(x: brBounds.width - flareAmt, y: 0), to: CGPoint(x: brBounds.width, y: brBounds.height))
         }
         
         let sparklesContainer = CALayer()
@@ -245,8 +276,16 @@ class VisualEffectOverlayWindow: NSPanel {
         densityMask.frame = sparklesContainer.bounds
         let maskSublayer = CAGradientLayer()
         maskSublayer.frame = beamRect
-        maskSublayer.startPoint = (edge == .left) ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 1, y: 0.5)
-        maskSublayer.endPoint = (edge == .left) ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0, y: 0.5)
+        if edge == .left {
+            maskSublayer.startPoint = CGPoint(x: 0, y: 0.5)
+            maskSublayer.endPoint = CGPoint(x: 1, y: 0.5)
+        } else if edge == .right {
+            maskSublayer.startPoint = CGPoint(x: 1, y: 0.5)
+            maskSublayer.endPoint = CGPoint(x: 0, y: 0.5)
+        } else {
+            maskSublayer.startPoint = CGPoint(x: 0.5, y: 0)
+            maskSublayer.endPoint = CGPoint(x: 0.5, y: 1)
+        }
         maskSublayer.colors = [
             NSColor.white.withAlphaComponent(1.0).cgColor,
             NSColor.white.withAlphaComponent(0.0).cgColor  

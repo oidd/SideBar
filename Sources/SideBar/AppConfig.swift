@@ -11,9 +11,16 @@ struct AppSettings: Codable, Equatable {
     var isEnabled: Bool
     var colorName: String // e.g. "orange", "blue", "green"
     var opacity: Double? // 可选类型确保与旧本地存档的向后兼容
-    var snapSide: String? // both / left / right
+    var snapSide: String? // left / right / bottom / leftRight / leftBottom / rightBottom / leftRightBottom
     var shortcutModifiers: UInt? // NSEvent.ModifierFlags.rawValue
     var shortcutKeyCode: UInt16? // 键码
+}
+
+enum DockAvoidanceMode: String, CaseIterable {
+    case automatic
+    case left
+    case right
+    case bottom
 }
 
 class AppConfig: ObservableObject {
@@ -37,6 +44,7 @@ class AppConfig: ObservableObject {
     private let mirrorPinEnabledKey = "SideBarMirrorPinEnabled"
     private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
     private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
+    private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
     
     // 格式: "PID:WindowID"
     @Published var hiddenWindowRecords: [String] = [] {
@@ -133,6 +141,13 @@ class AppConfig: ObservableObject {
             UserDefaults.standard.set(language, forKey: "SideBarLanguage")
         }
     }
+
+    @Published var dockAvoidanceModeRawValue: String = DockAvoidanceMode.automatic.rawValue {
+        didSet {
+            UserDefaults.standard.set(dockAvoidanceModeRawValue, forKey: dockAvoidanceModeKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
     
     private init() {
         self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
@@ -201,17 +216,29 @@ class AppConfig: ObservableObject {
         } else {
             self.language = UserDefaults.standard.integer(forKey: "SideBarLanguage")
         }
+
+        if let rawMode = UserDefaults.standard.string(forKey: dockAvoidanceModeKey),
+           DockAvoidanceMode(rawValue: rawMode) != nil {
+            self.dockAvoidanceModeRawValue = rawMode
+        } else {
+            self.dockAvoidanceModeRawValue = DockAvoidanceMode.automatic.rawValue
+            UserDefaults.standard.set(DockAvoidanceMode.automatic.rawValue, forKey: dockAvoidanceModeKey)
+        }
         
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
            let savedDict = try? JSONDecoder().decode([String: AppSettings].self, from: data) {
-            self.appSettings = savedDict
+            self.appSettings = savedDict.mapValues { setting in
+                var normalized = setting
+                normalized.snapSide = Self.normalizeSnapSide(setting.snapSide)
+                return normalized
+            }
         } else {
             // 兼容老版本的 Set 数据迁移
             let oldKey = "EnabledSideBarApps"
             let oldSet = UserDefaults.standard.stringArray(forKey: oldKey) ?? []
             var newDict: [String: AppSettings] = [:]
             for bundle in oldSet {
-                newDict[bundle] = AppSettings(isEnabled: true, colorName: "white", snapSide: "both")
+                newDict[bundle] = AppSettings(isEnabled: true, colorName: "white", snapSide: "leftRight")
             }
             self.appSettings = newDict
         }
@@ -290,7 +317,7 @@ class AppConfig: ObservableObject {
     }
 
     func getSnapSide(for bundleID: String) -> String {
-        return appSettings[bundleID]?.snapSide ?? "both"
+        Self.normalizeSnapSide(appSettings[bundleID]?.snapSide)
     }
     
     func updateOpacity(bundleID: String, opacity: Double) {
@@ -302,8 +329,36 @@ class AppConfig: ObservableObject {
 
     func updateSnapSide(bundleID: String, snapSide: String) {
         if var setting = appSettings[bundleID] {
-            setting.snapSide = snapSide
+            setting.snapSide = Self.normalizeSnapSide(snapSide)
             appSettings[bundleID] = setting
+        }
+    }
+
+    func setGlobalSnapSide(_ snapSide: String) {
+        var updated = appSettings
+        for (key, var setting) in updated {
+            if setting.isEnabled {
+                setting.snapSide = Self.normalizeSnapSide(snapSide)
+                updated[key] = setting
+            }
+        }
+        appSettings = updated
+    }
+
+    var dockAvoidanceMode: DockAvoidanceMode {
+        DockAvoidanceMode(rawValue: dockAvoidanceModeRawValue) ?? .automatic
+    }
+
+    func setDockAvoidanceMode(_ mode: DockAvoidanceMode) {
+        dockAvoidanceModeRawValue = mode.rawValue
+    }
+
+    func resolvedDockAvoidanceSide() -> String? {
+        switch dockAvoidanceMode {
+        case .automatic:
+            return Self.detectDockOrientation()
+        case .left, .right, .bottom:
+            return dockAvoidanceMode.rawValue
         }
     }
     
@@ -313,7 +368,7 @@ class AppConfig: ObservableObject {
             isEnabled: isEnabled,
             colorName: colorName,
             opacity: existing?.opacity ?? 1.0,
-            snapSide: existing?.snapSide ?? "both",
+            snapSide: Self.normalizeSnapSide(existing?.snapSide),
             shortcutModifiers: existing?.shortcutModifiers,
             shortcutKeyCode: existing?.shortcutKeyCode
         )
@@ -325,7 +380,7 @@ class AppConfig: ObservableObject {
             isEnabled: isEnabled,
             colorName: existing?.colorName ?? "auto",
             opacity: existing?.opacity ?? 1.0,
-            snapSide: existing?.snapSide ?? "both",
+            snapSide: Self.normalizeSnapSide(existing?.snapSide),
             shortcutModifiers: existing?.shortcutModifiers,
             shortcutKeyCode: existing?.shortcutKeyCode
         )
@@ -439,6 +494,34 @@ class AppConfig: ObservableObject {
     /// 检测 DockMinimize 是否正在运行
     static func isDockMinimizeRunning() -> Bool {
         return !NSRunningApplication.runningApplications(withBundleIdentifier: "com.dockminimize.app").isEmpty
+    }
+
+    private static func normalizeSnapSide(_ rawValue: String?) -> String {
+        switch rawValue {
+        case "both", "leftRight":
+            return "leftRight"
+        case "left", "right", "bottom", "leftBottom", "rightBottom":
+            return rawValue ?? "leftRight"
+        case "leftRightBottom":
+            return "leftRight"
+        default:
+            return "leftRight"
+        }
+    }
+
+    static func detectDockOrientation() -> String? {
+        if let orientation = UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation"),
+           ["left", "right", "bottom"].contains(orientation) {
+            return orientation
+        }
+
+        if let persistentDomain = UserDefaults.standard.persistentDomain(forName: "com.apple.dock"),
+           let orientation = persistentDomain["orientation"] as? String,
+           ["left", "right", "bottom"].contains(orientation) {
+            return orientation
+        }
+
+        return nil
     }
     
     func updateLaunchAtLogin(_ enable: Bool) {

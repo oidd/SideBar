@@ -4,7 +4,7 @@ import CoreVideo
 
 enum SnapState {
     case floating
-    case snapped(edge: Int, hiddenOrX: CGFloat) // 1=left, 2=right
+    case snapped(edge: Int, hiddenOrX: CGFloat) // 1=left, 2=right, 3=bottom
     case expanded
 }
 
@@ -21,6 +21,11 @@ private final class WeakWindowSessionBox {
 }
 
 class WindowSession {
+    private enum BottomSettleAxis {
+        case x
+        case y
+    }
+
     let appElement: AXUIElement
     let windowElement: AXUIElement
     let pid: pid_t
@@ -29,7 +34,7 @@ class WindowSession {
     private let appIcon: NSImage?
     
     private var state: SnapState = .floating
-    private var currentEdge: Int = 0 
+    private var currentEdge: Int = 0
     
     // MARK: - 多显示器支持
     
@@ -52,13 +57,30 @@ class WindowSession {
     }
 
     private func isSnapAllowed(for edge: Int) -> Bool {
-        switch AppConfig.shared.getSnapSide(for: bundleID) {
-        case "left":
-            return edge == 1
-        case "right":
-            return edge == 2
+        let snapSide = AppConfig.shared.getSnapSide(for: bundleID)
+        let blockedDockSide = AppConfig.shared.resolvedDockAvoidanceSide()
+
+        if blockedDockSide == "left", edge == 1 {
+            return false
+        }
+
+        if blockedDockSide == "right", edge == 2 {
+            return false
+        }
+
+        if blockedDockSide == "bottom", edge == 3 {
+            return false
+        }
+
+        switch edge {
+        case 1:
+            return snapSide == "left" || snapSide == "leftRight" || snapSide == "leftBottom" || snapSide == "leftRightBottom"
+        case 2:
+            return snapSide == "right" || snapSide == "leftRight" || snapSide == "rightBottom" || snapSide == "leftRightBottom"
+        case 3:
+            return snapSide == "bottom" || snapSide == "leftBottom" || snapSide == "rightBottom" || snapSide == "leftRightBottom"
         default:
-            return true
+            return false
         }
     }
 
@@ -140,10 +162,13 @@ class WindowSession {
             
             // 是否在垂直方向上有交叠
             let yOverlap = (cgRect.minY < bounds.maxY && cgRect.maxY > bounds.minY)
+            let xOverlap = (cgRect.minX < bounds.maxX && cgRect.maxX > bounds.minX)
             if edge == 1 { // 左边缘：检查是否有屏幕的右侧贴着这里
                 if abs(cgRect.maxX - bounds.minX) <= tolerance && yOverlap { return true }
             } else if edge == 2 { // 右边缘：检查是否有屏幕的左侧贴着这里
                 if abs(cgRect.minX - bounds.maxX) <= tolerance && yOverlap { return true }
+            } else if edge == 3 { // 底部边缘：检查是否有屏幕的顶部贴着这里
+                if abs(cgRect.minY - bounds.maxY) <= tolerance && xOverlap { return true }
             }
         }
         return false
@@ -188,6 +213,8 @@ class WindowSession {
     private var isMirrorOverlayVisible = false
     private var mirrorHidesRealWindow = false
     private var mirrorRefreshTimer: Timer?
+    private var bottomSettleTimer: Timer?
+    private var bottomResidualY: CGFloat?
     private var pinnedAnchor: PinnedAnchor?
     private var pinControlRevealSuppressionUntil: Date = .distantPast
     var isDragging = false
@@ -337,15 +364,24 @@ class WindowSession {
              return
         }
 
-        // 依靠 CGWindowID 重构出来的绝对在屏校验
-        let isOnScreen = isWindowOnScreen()
+        // 底部折叠时真实窗口会被停放到侧边屏外，因此这里不能再用“是否真的在屏幕内”来决定是否显示快照条。
+        let isBottomSnapped = currentEdge == 3 && {
+            if case .snapped = state { return true }
+            return false
+        }()
+        let isOnScreen = isBottomSnapped || isWindowOnScreen()
         
         switch state {
         case .snapped, .expanded:
             if isOnScreen {
                 if !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1 {
                     if Date() >= indicatorAnimationSuppressionUntil {
-                        indicatorWindow.animateExpandFromDot()
+                        if currentEdge == 3 {
+                            indicatorWindow.alphaValue = 1.0
+                            indicatorWindow.orderFront(nil)
+                        } else {
+                            indicatorWindow.animateExpandFromDot()
+                        }
                     }
                 }
                 showIndicator(animated: Date() >= indicatorAnimationSuppressionUntil)
@@ -846,7 +882,14 @@ class WindowSession {
     private func pinnedExpandedTargetFrame(from currentFrame: CGRect) -> CGRect? {
         guard let anchor = pinnedAnchor else { return nil }
         let displayBounds = getDisplayBounds()
-        let targetX = currentEdge == 1 ? displayBounds.minX : displayBounds.maxX - currentFrame.width
+        let targetX: CGFloat
+        if currentEdge == 1 {
+            targetX = displayBounds.minX
+        } else if currentEdge == 2 {
+            targetX = displayBounds.maxX - currentFrame.width
+        } else {
+            targetX = clampBottomExpandedX(for: currentFrame, displayBounds: displayBounds)
+        }
         let targetY = Swift.max(
             displayBounds.minY,
             Swift.min(anchor.expandedMidY - currentFrame.height / 2, displayBounds.maxY - currentFrame.height)
@@ -860,7 +903,17 @@ class WindowSession {
            let targetFrame = pinnedExpandedTargetFrame(from: rawFrame) {
             return targetFrame
         }
-        return getWindowFrame()
+        guard let frame = getWindowFrame() else { return nil }
+        if currentEdge == 3, case .snapped = state {
+            let displayBounds = getDisplayBounds()
+            return CGRect(
+                x: storedBottomExpandedX(for: frame, displayBounds: displayBounds),
+                y: displayBounds.maxY - frame.height,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+        return frame
     }
 
     private func focusedWindowOfApp() -> AXUIElement? {
@@ -1000,6 +1053,8 @@ class WindowSession {
             buttonSide = leftFits || !rightFits ? .left : .right
         case .right:
             buttonSide = rightFits || !leftFits ? .right : .left
+        case .bottom:
+            buttonSide = .right
         }
 
         let proposedX: CGFloat
@@ -1055,18 +1110,17 @@ class WindowSession {
 
     func fusionReveal() {
         guard !isTemporarilyPinned else { return }
-        guard let coords = getXCoords() else { return }
-        guard let visualHiddenX = getVisualHiddenX() else { return }
+        guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
         let targetFrame = CGRect(
-            x: coords.expandedX,
-            y: currentFrame.minY,
+            x: geometry.expanded.x,
+            y: geometry.expanded.y,
             width: lockedWidth > 0 ? lockedWidth : currentFrame.width,
             height: currentFrame.height
         )
         let hiddenFrame = CGRect(
-            x: visualHiddenX,
-            y: currentFrame.minY,
+            x: geometry.visualHidden.x,
+            y: geometry.visualHidden.y,
             width: targetFrame.width,
             height: targetFrame.height
         )
@@ -1096,6 +1150,8 @@ class WindowSession {
         animateWindowPositionFast(
             from: hiddenFrame.minX,
             to: targetFrame.minX,
+            startY: hiddenFrame.minY,
+            endY: targetFrame.minY,
             duration: fusionTransitionDuration(),
             easeIn: false
         ) { [weak self] in
@@ -1111,17 +1167,16 @@ class WindowSession {
 
     func fusionHide() {
         guard !isTemporarilyPinned else { return }
-        guard let coords = getXCoords() else { return }
-        guard let visualHiddenX = getVisualHiddenX() else { return }
+        guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
         let hiddenFrame = CGRect(
-            x: visualHiddenX,
-            y: currentFrame.minY,
+            x: geometry.visualHidden.x,
+            y: geometry.visualHidden.y,
             width: lockedWidth > 0 ? lockedWidth : currentFrame.width,
             height: currentFrame.height
         )
 
-        state = .snapped(edge: currentEdge, hiddenOrX: coords.hiddenX)
+        state = .snapped(edge: currentEdge, hiddenOrX: currentEdge == 3 ? geometry.expanded.x : geometry.hidden.x)
         notifyTemporaryShortcutStashStateChanged(isStashed: true)
         isAnimating = true
         pendingDockInteraction = false
@@ -1139,6 +1194,8 @@ class WindowSession {
         animateWindowPositionFast(
             from: currentFrame.minX,
             to: hiddenFrame.minX,
+            startY: currentFrame.minY,
+            endY: hiddenFrame.minY,
             duration: fusionTransitionDuration(),
             easeIn: true
         ) { [weak self] in
@@ -1202,13 +1259,36 @@ class WindowSession {
         indicatorAnimationSuppressionUntil = Date().addingTimeInterval(duration)
     }
 
-    private func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool) {
-        guard let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) else { return }
-        WindowAlphaManager.shared.setAlpha(for: windowID, alpha: Float(alpha))
-        if isHidden {
-            AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
-        } else {
-            AppConfig.shared.removeHiddenWindowRecord(pid: self.pid, windowID: windowID)
+    private func trackedWindowIDsForAlpha(frameHint: CGRect? = nil) -> [CGWindowID] {
+        if currentEdge == 3 {
+            let windowIDs = WindowAlphaManager.shared.findRelatedWindowIDs(
+                for: windowElement,
+                pid: pid,
+                frameHint: frameHint
+            )
+            if !windowIDs.isEmpty {
+                return windowIDs
+            }
+        }
+
+        if let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) {
+            return [windowID]
+        }
+        return []
+    }
+
+    private func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) {
+        let resolvedFrameHint = frameHint ?? (currentEdge == 3 ? getRawWindowFrame() : nil)
+        let windowIDs = trackedWindowIDsForAlpha(frameHint: resolvedFrameHint)
+        guard !windowIDs.isEmpty else { return }
+
+        WindowAlphaManager.shared.setAlpha(for: windowIDs, alpha: Float(alpha))
+        for windowID in windowIDs {
+            if isHidden {
+                AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
+            } else {
+                AppConfig.shared.removeHiddenWindowRecord(pid: self.pid, windowID: windowID)
+            }
         }
     }
 
@@ -1235,6 +1315,7 @@ class WindowSession {
 
     func restoreAndDestroy() {
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
+        cancelBottomSettleTimer()
         isTemporarilyPinned = false
         isMirrorPinActive = false
         isMirrorOverlayVisible = false
@@ -1243,9 +1324,7 @@ class WindowSession {
         stopMirrorRefreshTimer()
         mirrorOverlayWindow.hide()
         setMirrorSourceWindowHidden(false)
-        if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-            WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-        }
+        setWindowAlpha(1.0, isHidden: false)
         
         if let runningApp = NSRunningApplication(processIdentifier: pid), runningApp.isHidden {
             runningApp.unhide()
@@ -1261,18 +1340,21 @@ class WindowSession {
             // 核心修复：退出时将窗口完整推回屏幕内。
             let displayBounds = getDisplayBounds()
             let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
-            let currentY = currentFrame.minY
             let winWidth = lockedWidth > 0 ? lockedWidth : currentFrame.width
             
-            // 计算安全着陆 X 轴：确保窗口边缘与屏幕边缘保持至少 80px 的间距（对应用户反馈的右侧残留问题）
-            let safeX: CGFloat
-            if currentEdge == 1 { // 原在左侧
-                safeX = displayBounds.minX + 80
+            let safePosition: CGPoint
+            if currentEdge == 1 {
+                safePosition = CGPoint(x: displayBounds.minX + 80, y: currentFrame.minY)
+            } else if currentEdge == 2 {
+                safePosition = CGPoint(x: displayBounds.maxX - winWidth - 80, y: currentFrame.minY)
             } else { // 原在右侧
-                safeX = displayBounds.maxX - winWidth - 80
+                safePosition = CGPoint(
+                    x: storedBottomExpandedX(for: currentFrame, displayBounds: displayBounds),
+                    y: displayBounds.maxY - currentFrame.height - 80
+                )
             }
             
-            setWindowPosition(position: CGPoint(x: safeX, y: currentY))
+            setWindowPosition(position: safePosition)
         }
         destroy()
     }
@@ -1280,6 +1362,7 @@ class WindowSession {
     private func destroy() {
         Self.unregister(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        cancelBottomSettleTimer()
         if let source = observerRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .defaultMode)
             observerRunLoopSource = nil
@@ -1474,10 +1557,12 @@ class WindowSession {
         if case .floating = state { return }
         print("🗕 窗口被最小化，解除边栏")
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
+        cancelBottomSettleTimer()
         isTemporarilyPinned = false
         isMirrorPinActive = false
         isMirrorOverlayVisible = false
         pinnedAnchor = nil
+        bottomResidualY = nil
         stopPinnedRaisePulse()
         stopMirrorRefreshTimer()
         state = .floating
@@ -1541,20 +1626,12 @@ class WindowSession {
         case .floating:
             guard let frame = getWindowFrame() else { return }
             let displayBounds = detectDisplayBounds()
-            let canUseLeftEdge = !hasAdjacentScreen(at: 1, bounds: displayBounds)
-            let canUseRightEdge = !hasAdjacentScreen(at: 2, bounds: displayBounds)
+            let candidateEdges = [1, 2, 3].filter {
+                !hasAdjacentScreen(at: $0, bounds: displayBounds) && isSnapAllowed(for: $0)
+            }
 
-            let targetEdge: Int?
-            if canUseLeftEdge && canUseRightEdge {
-                let leftDistance = abs(frame.minX - displayBounds.minX)
-                let rightDistance = abs(displayBounds.maxX - frame.maxX)
-                targetEdge = leftDistance <= rightDistance ? 1 : 2
-            } else if canUseLeftEdge {
-                targetEdge = 1
-            } else if canUseRightEdge {
-                targetEdge = 2
-            } else {
-                targetEdge = nil
+            let targetEdge = candidateEdges.min { lhs, rhs in
+                distanceToEdge(lhs, frame: frame, displayBounds: displayBounds) < distanceToEdge(rhs, frame: frame, displayBounds: displayBounds)
             }
 
             guard let targetEdge else { return }
@@ -1577,6 +1654,7 @@ class WindowSession {
         let edgeThreshold: CGFloat = 40
         let minX = displayBounds.minX
         let maxX = displayBounds.maxX
+        let maxY = displayBounds.maxY
         
         if !wasDragging { return }
         if isTemporarilyPinned {
@@ -1594,19 +1672,49 @@ class WindowSession {
             return
         }
         
-        let isRightEdge = frame.maxX >= (maxX - edgeThreshold) && !hasAdjacentScreen(at: 2, bounds: displayBounds) && isSnapAllowed(for: 2)
-        let isLeftEdge = frame.minX <= (minX + edgeThreshold) && !hasAdjacentScreen(at: 1, bounds: displayBounds) && isSnapAllowed(for: 1)
-        
-        if isRightEdge {
-            lockCurrentScreen() // 吸附前锁定屏幕
-            snapToEdge(edgeConfig: 2, frame: frame, displayBounds: displayBounds)
-        } else if isLeftEdge {
-            lockCurrentScreen() // 吸附前锁定屏幕
-            snapToEdge(edgeConfig: 1, frame: frame, displayBounds: displayBounds)
+        let candidateEdges = [1, 2, 3].compactMap { edge -> (edge: Int, score: CGFloat)? in
+            guard !hasAdjacentScreen(at: edge, bounds: displayBounds), isSnapAllowed(for: edge) else { return nil }
+            switch edge {
+            case 1:
+                guard frame.minX <= (minX + edgeThreshold) else { return nil }
+                return (edge, (minX + edgeThreshold) - frame.minX)
+            case 2:
+                guard frame.maxX >= (maxX - edgeThreshold) else { return nil }
+                return (edge, frame.maxX - (maxX - edgeThreshold))
+            case 3:
+                guard frame.maxY >= (maxY - edgeThreshold) else { return nil }
+                return (edge, frame.maxY - (maxY - edgeThreshold))
+            default:
+                return nil
+            }
+        }
+
+        let resolvedBestEdge: Int? = {
+            guard let bestCandidate = candidateEdges.max(by: { lhs, rhs in
+                if abs(lhs.score - rhs.score) < 0.5 {
+                    return edgePriority(lhs.edge) > edgePriority(rhs.edge)
+                }
+                return lhs.score < rhs.score
+            }) else { return nil }
+
+            if let bottomCandidate = candidateEdges.first(where: { $0.edge == 3 }),
+               bestCandidate.edge != 3,
+               bottomCandidate.score >= bestCandidate.score - 14 {
+                return 3
+            }
+
+            return bestCandidate.edge
+        }()
+
+        if let bestEdge = resolvedBestEdge {
+            lockCurrentScreen()
+            snapToEdge(edgeConfig: bestEdge, frame: frame, displayBounds: displayBounds)
         } else {
             if case .floating = state {} else {
                 print("👋 窗口拖离边缘，解除隐藏")
                 let shouldEndTemporaryShortcutSession = isTemporaryShortcutManaged
+                cancelBottomSettleTimer()
+                bottomResidualY = nil
                 state = .floating
                 notifyTemporaryShortcutStashStateChanged(isStashed: false)
                 unlockScreen() // 取消吸附时清空屏幕缓存
@@ -1630,32 +1738,174 @@ class WindowSession {
         }
     }
     
-    private func getXCoords() -> (expandedX: CGFloat, hiddenX: CGFloat)? {
-        guard let frame = getWindowFrame() else { return nil }
-        let displayBounds = getDisplayBounds()
-        let w = lockedWidth > 0 ? lockedWidth : frame.width
-        
-        // 展开坐标：左侧始终固定 minX，右侧使用锁定宽度（防漂移核心）
-        let exX = (currentEdge == 1) ? displayBounds.minX : displayBounds.maxX - w
-        
-        // 隐藏坐标：由于 macOS 可能会塞胖窗口，左侧隐藏时必须把当前真实的物理宽度(frame.width)全部推出去
-        let hideOffset: CGFloat = 20000
-        let hidX = (currentEdge == 1) ? displayBounds.minX - frame.width - hideOffset : displayBounds.maxX + hideOffset
-        return (exX, hidX)
+    private func clampBottomExpandedX(for frame: CGRect, displayBounds: CGRect) -> CGFloat {
+        let width = lockedWidth > 0 ? lockedWidth : frame.width
+        let maxX = max(displayBounds.minX, displayBounds.maxX - width)
+        return min(max(frame.minX, displayBounds.minX), maxX)
     }
 
-    private func getVisualHiddenX() -> CGFloat? {
-        guard let frame = getWindowFrame() else { return nil }
-        let displayBounds = getDisplayBounds()
-        let visualHideOffset: CGFloat = 1
-        
-        if currentEdge == 1 {
-            // 左侧隐藏：必须用实际物理宽度(frame.width)推离边界，否则系统增大的尺寸会变成漏边
-            return displayBounds.minX - frame.width + visualHideOffset
-        } else {
-            // 右侧隐藏：与宽度无关，只要起点在屏幕外即可
-            return displayBounds.maxX - visualHideOffset
+    private func storedBottomExpandedX(for frame: CGRect, displayBounds: CGRect) -> CGFloat {
+        if case .snapped(edge: 3, hiddenOrX: let storedX) = state {
+            let width = lockedWidth > 0 ? lockedWidth : frame.width
+            let maxX = max(displayBounds.minX, displayBounds.maxX - width)
+            return min(max(storedX, displayBounds.minX), maxX)
         }
+        return clampBottomExpandedX(for: frame, displayBounds: displayBounds)
+    }
+
+    private func bottomParkedHiddenPosition(for frame: CGRect, displayBounds: CGRect) -> CGPoint {
+        let visualHideOffset: CGFloat = 1
+        let parkedY = bottomResidualY ?? (displayBounds.maxY - 1)
+        let parkRight = CGPoint(x: displayBounds.maxX - visualHideOffset, y: parkedY)
+        let parkLeft = CGPoint(x: displayBounds.minX - frame.width + visualHideOffset, y: parkedY)
+        let dockSide = AppConfig.shared.resolvedDockAvoidanceSide()
+        let canParkLeft = !hasAdjacentScreen(at: 1, bounds: displayBounds) && dockSide != "left"
+        let canParkRight = !hasAdjacentScreen(at: 2, bounds: displayBounds) && dockSide != "right"
+
+        if canParkRight && canParkLeft {
+            let expandedX = storedBottomExpandedX(for: frame, displayBounds: displayBounds)
+            let midpoint = displayBounds.midX
+            return expandedX >= midpoint ? parkRight : parkLeft
+        }
+        if canParkRight {
+            return parkRight
+        }
+        if canParkLeft {
+            return parkLeft
+        }
+
+        return CGPoint(x: storedBottomExpandedX(for: frame, displayBounds: displayBounds), y: parkedY)
+    }
+
+    private func bottomVerticalAttemptPosition(for frame: CGRect, displayBounds: CGRect) -> CGPoint {
+        CGPoint(
+            x: frame.minX,
+            y: displayBounds.maxY - 1
+        )
+    }
+
+    private func cancelBottomSettleTimer() {
+        bottomSettleTimer?.invalidate()
+        bottomSettleTimer = nil
+    }
+
+    private func waitForBottomAxisToSettle(
+        axis: BottomSettleAxis,
+        startValue: CGFloat,
+        targetValue: CGFloat,
+        minProgress: CGFloat,
+        timeout: TimeInterval,
+        onSettled: @escaping (CGRect) -> Void
+    ) {
+        cancelBottomSettleTimer()
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+        var lastValue: CGFloat?
+        var stableSamples = 0
+        let totalDistance = abs(targetValue - startValue)
+
+        bottomSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            guard let frame = self.getRawWindowFrame() else {
+                if CFAbsoluteTimeGetCurrent() - startTime >= timeout {
+                    timer.invalidate()
+                    self.bottomSettleTimer = nil
+                }
+                return
+            }
+
+            let value: CGFloat
+            switch axis {
+            case .x:
+                value = frame.minX
+            case .y:
+                value = frame.minY
+            }
+            if let lastValue, abs(value - lastValue) <= 1.0 {
+                stableSamples += 1
+            } else {
+                stableSamples = 0
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            let movedDistance = abs(value - startValue)
+            let progress = totalDistance <= 1 ? 1.0 : min(1.0, movedDistance / totalDistance)
+            let nearTarget = abs(value - targetValue) <= 4.0
+            let reachedProgressGate = progress >= minProgress
+            let isStable = stableSamples >= 4 && elapsed >= 0.064 && (nearTarget || reachedProgressGate)
+            let timedOut = elapsed >= timeout
+
+            if isStable || timedOut {
+                timer.invalidate()
+                self.bottomSettleTimer = nil
+                onSettled(frame)
+                return
+            }
+
+            lastValue = value
+        }
+    }
+
+    private func edgeGeometry(for frame: CGRect? = nil) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
+        guard let frame = frame ?? getWindowFrame() else { return nil }
+        let displayBounds = getDisplayBounds()
+        let lockedOrCurrentWidth = lockedWidth > 0 ? lockedWidth : frame.width
+        let hideOffset: CGFloat = 20000
+        let visualHideOffset: CGFloat = 1
+
+        switch currentEdge {
+        case 1:
+            let expanded = CGPoint(x: displayBounds.minX, y: frame.minY)
+            let hidden = CGPoint(x: displayBounds.minX - frame.width - hideOffset, y: frame.minY)
+            let visualHidden = CGPoint(x: displayBounds.minX - frame.width + visualHideOffset, y: frame.minY)
+            return (expanded, hidden, visualHidden)
+        case 2:
+            let expanded = CGPoint(x: displayBounds.maxX - lockedOrCurrentWidth, y: frame.minY)
+            let hidden = CGPoint(x: displayBounds.maxX + hideOffset, y: frame.minY)
+            let visualHidden = CGPoint(x: displayBounds.maxX - visualHideOffset, y: frame.minY)
+            return (expanded, hidden, visualHidden)
+        case 3:
+            let expandedX = storedBottomExpandedX(for: frame, displayBounds: displayBounds)
+            let expanded = CGPoint(x: expandedX, y: displayBounds.maxY - frame.height)
+            let hidden = bottomParkedHiddenPosition(for: frame, displayBounds: displayBounds)
+            let visualHidden = hidden
+            return (expanded, hidden, visualHidden)
+        default:
+            return nil
+        }
+    }
+
+    private func distanceToEdge(_ edge: Int, frame: CGRect, displayBounds: CGRect) -> CGFloat {
+        switch edge {
+        case 1:
+            return abs(frame.minX - displayBounds.minX)
+        case 2:
+            return abs(displayBounds.maxX - frame.maxX)
+        case 3:
+            return abs(displayBounds.maxY - frame.maxY)
+        default:
+            return .greatestFiniteMagnitude
+        }
+    }
+
+    private func edgePriority(_ edge: Int) -> Int {
+        switch edge {
+        case 3:
+            return 3
+        case 2:
+            return 2
+        case 1:
+            return 1
+        default:
+            return 0
+        }
+    }
+
+    private func collapsedWindowAlpha() -> Float {
+        0.01
     }
     
     private func checkAndAdoptEdgeState() {
@@ -1663,42 +1913,51 @@ class WindowSession {
         let displayBounds = getDisplayBounds()
         let threshold: CGFloat = 8 // 允许一定误差
         
-        // 计算预期的隐藏坐标 (基于 1px 的锚点)
         let leftHiddenX = displayBounds.minX - frame.width + 1
         let rightHiddenX = displayBounds.maxX - 1
+        let bottomHiddenY = displayBounds.maxY - 1
         
         let shouldSnapLeft = abs(frame.minX - leftHiddenX) <= threshold && !hasAdjacentScreen(at: 1, bounds: displayBounds) && isSnapAllowed(for: 1)
         let shouldSnapRight = abs(frame.minX - rightHiddenX) <= threshold && !hasAdjacentScreen(at: 2, bounds: displayBounds) && isSnapAllowed(for: 2)
+        let shouldSnapBottom = abs(frame.minY - bottomHiddenY) <= threshold && !hasAdjacentScreen(at: 3, bounds: displayBounds) && isSnapAllowed(for: 3)
         
-        if shouldSnapLeft {
+        if shouldSnapBottom {
+            print("⚓ 自动收编: 检测到 \(bundleID) 在底部边缘，进入吸附态")
+            currentEdge = 3
+            lockedWidth = frame.width
+            lockCurrentScreen()
+            state = .snapped(edge: 3, hiddenOrX: edgeGeometry(for: frame)?.expanded.x ?? frame.minX)
+            indicatorWindow.alphaValue = 1.0
+            showIndicator()
+            updatePinControlWindow()
+
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: frame)
+            if let geometry = edgeGeometry(for: frame) {
+                setWindowPosition(position: geometry.hidden)
+            }
+        } else if shouldSnapLeft {
             print("⚓ 自动收编: 检测到 \(bundleID) 在左边缘，进入吸附态")
             currentEdge = 1
             lockedWidth = frame.width
             lockCurrentScreen() // 吸附时锁定屏幕
-            state = .snapped(edge: 1, hiddenOrX: getXCoords()?.hiddenX ?? 0)
+            state = .snapped(edge: 1, hiddenOrX: edgeGeometry(for: frame)?.hidden.x ?? 0)
             indicatorWindow.alphaValue = 1.0 // 核心修复：解除 init 时的透明锁定
             showIndicator()
             updatePinControlWindow()
             
             // 确保应用重启后（macOS可能会恢复其位置但初始 alpha 为 1）窗口视觉被正确隐藏
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 0.01)
-                AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
-            }
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: frame)
         } else if shouldSnapRight {
             print("⚓ 自动收编: 检测到 \(bundleID) 在右边缘，进入吸附态")
             currentEdge = 2
             lockedWidth = frame.width
             lockCurrentScreen() // 吸附时锁定屏幕
-            state = .snapped(edge: 2, hiddenOrX: getXCoords()?.hiddenX ?? 0)
+            state = .snapped(edge: 2, hiddenOrX: edgeGeometry(for: frame)?.hidden.x ?? 0)
             indicatorWindow.alphaValue = 1.0 // 核心修复：解除 init 时的透明锁定
             showIndicator()
             updatePinControlWindow()
             
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 0.01)
-                AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
-            }
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: frame)
         }
     }
     
@@ -1735,6 +1994,10 @@ class WindowSession {
         )
     }
     private func snapToEdge(edgeConfig: Int, frame: CGRect, displayBounds: CGRect) {
+        cancelBottomSettleTimer()
+        if edgeConfig != 3 {
+            bottomResidualY = nil
+        }
         currentEdge = edgeConfig
         collapseWindow()
         // 首次吸附后释放前台状态，确保后续 Dock 点击能触发激活通知
@@ -1748,6 +2011,7 @@ class WindowSession {
         if isAnimating { return } // 正在动画中，拒绝新指令
         lastCollapseTime = Date() // 记录折叠时间戳用于防抖
         outsideCollapseCandidateSince = nil
+        let effectiveImmediate = immediate
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
         
         // 必须在计算坐标前抓取最新尺寸
@@ -1762,68 +2026,146 @@ class WindowSession {
         
         let currentFrame = rawFrame
         
-        guard let coords = getXCoords() else { return }
-        guard let visualHiddenX = getVisualHiddenX() else { return }
+        guard let geometry = edgeGeometry(for: currentFrame) else { return }
         
-        state = .snapped(edge: currentEdge, hiddenOrX: coords.hiddenX)
+        state = .snapped(edge: currentEdge, hiddenOrX: currentEdge == 3 ? geometry.expanded.x : geometry.hidden.x)
         notifyTemporaryShortcutStashStateChanged(isStashed: true)
         isAnimating = true
         
         // 我们以鼠标所在位置作为碰撞中心
         let mouseLoc = NSEvent.mouseLocation
         let screenForWin = getScreenForWindow()
-        let impactPoint = CGPoint(x: (currentEdge == 1) ? screenForWin.frame.minX : screenForWin.frame.maxX, y: mouseLoc.y)
+        let impactPoint: CGPoint
+        if currentEdge == 1 {
+            impactPoint = CGPoint(x: screenForWin.frame.minX, y: mouseLoc.y)
+        } else if currentEdge == 2 {
+            impactPoint = CGPoint(x: screenForWin.frame.maxX, y: mouseLoc.y)
+        } else {
+            impactPoint = CGPoint(x: mouseLoc.x, y: screenForWin.frame.minY)
+        }
         let customColor = AppConfig.shared.getColor(for: bundleID)
-        let edge: SnapEdge = currentEdge == 1 ? .left : .right
+        let edge: SnapEdge = currentEdge == 1 ? .left : (currentEdge == 2 ? .right : .bottom)
 
         if !shouldTriggerEffects {
             effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         }
 
-        if immediate {
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 0.01)
-                AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
-            }
-            setWindowPosition(position: CGPoint(x: visualHiddenX, y: currentFrame.minY))
+        if effectiveImmediate {
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
+            setWindowPosition(position: geometry.visualHidden)
             isAnimating = false
             if shouldTriggerEffects {
                 triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
             }
+            indicatorWindow.alphaValue = 1.0
             showIndicator()
             updatePinControlWindow()
             return
         }
 
-        // 1. 发起平滑的滑入边缘动画
-        animateWindowPositionFast(from: currentFrame.minX, to: visualHiddenX, duration: standardTransitionDuration(), easeIn: true) { [weak self] in
-            guard let self = self else { return }
-            
-            // 2. 核心：纯 Alpha 隐藏 (弃用系统 Hide)
-            // 窗口到达边缘后直接设为不可见，不调用 runningApp.hide()，彻底规避系统动画
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 0.01)
-                // 持久化记录：防止崩溃导致窗口丢失
-                AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
+        if currentEdge == 3 {
+            let displayBounds = getDisplayBounds()
+            let verticalAttempt = bottomVerticalAttemptPosition(for: currentFrame, displayBounds: displayBounds)
+
+            let finishBottomCollapse: (CGPoint, CGRect) -> Void = { [weak self] hiddenPosition, settledFrame in
+                guard let self else { return }
+                self.setWindowAlpha(CGFloat(self.collapsedWindowAlpha()), isHidden: true, frameHint: settledFrame)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                    self.setWindowPosition(position: hiddenPosition)
+                    self.isAnimating = false
+                    if shouldTriggerEffects {
+                        self.triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
+                        if !self.indicatorWindow.isVisible || self.indicatorWindow.alphaValue < 0.1 {
+                            self.indicatorWindow.alphaValue = 1.0
+                            self.indicatorWindow.orderFront(nil)
+                        }
+                    }
+                    self.indicatorWindow.alphaValue = 1.0
+                    self.showIndicator()
+                    self.updatePinControlWindow()
+                }
             }
-            
-            // 延时解锁，确保动画序列完整
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                // 安全降落：即便动画指令流由于宽窗口 App 繁忙发生意外，我们也强制在终点降落一次
-                self.setWindowPosition(position: CGPoint(x: visualHiddenX, y: currentFrame.minY))
-                
-                self.isAnimating = false
-                if shouldTriggerEffects {
-                    self.triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
-                    if !self.indicatorWindow.isVisible || self.indicatorWindow.alphaValue < 0.1 {
-                        self.indicatorWindow.animateExpandFromDot()
+
+            let startBottomHorizontalCollapse: (CGRect) -> Void = { [weak self] settledFrame in
+                guard let self else { return }
+                self.bottomResidualY = settledFrame.minY
+                let horizontalHidden = self.bottomParkedHiddenPosition(for: settledFrame, displayBounds: displayBounds)
+                self.animateWindowPositionFast(
+                    from: settledFrame.minX,
+                    to: horizontalHidden.x,
+                    startY: settledFrame.minY,
+                    endY: settledFrame.minY,
+                    duration: self.standardTransitionDuration(),
+                    easeIn: true
+                ) { [weak self] in
+                    guard let self else { return }
+                    self.waitForBottomAxisToSettle(
+                        axis: .x,
+                        startValue: settledFrame.minX,
+                        targetValue: horizontalHidden.x,
+                        minProgress: 0.82,
+                        timeout: 0.36
+                    ) { finalFrame in
+                        finishBottomCollapse(horizontalHidden, finalFrame)
                     }
                 }
-                self.indicatorWindow.alphaValue = 1.0
-                self.showIndicator()
-                self.updatePinControlWindow()
+            }
+
+            animateWindowPositionFast(
+                from: currentFrame.minX,
+                to: verticalAttempt.x,
+                startY: currentFrame.minY,
+                endY: verticalAttempt.y,
+                duration: standardTransitionDuration(),
+                easeIn: true
+            ) { [weak self] in
+                guard let self else { return }
+                self.waitForBottomAxisToSettle(
+                    axis: .y,
+                    startValue: currentFrame.minY,
+                    targetValue: verticalAttempt.y,
+                    minProgress: 0.72,
+                    timeout: 0.46
+                ) { settledFrame in
+                    startBottomHorizontalCollapse(settledFrame)
+                }
+            }
+            return
+        }
+
+        let startCollapse = { [weak self] in
+            guard let self else { return }
+
+            self.animateWindowPositionFast(
+                from: currentFrame.minX,
+                to: geometry.visualHidden.x,
+                startY: currentFrame.minY,
+                endY: geometry.visualHidden.y,
+                duration: self.standardTransitionDuration(),
+                easeIn: true
+            ) { [weak self] in
+                guard let self = self else { return }
+                
+                self.setWindowAlpha(CGFloat(self.collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
+                
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    self.setWindowPosition(position: geometry.visualHidden)
+                    
+                    self.isAnimating = false
+                    if shouldTriggerEffects {
+                        self.triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
+                        if !self.indicatorWindow.isVisible || self.indicatorWindow.alphaValue < 0.1 {
+                            self.indicatorWindow.animateExpandFromDot()
+                        }
+                    }
+                    self.indicatorWindow.alphaValue = 1.0
+                    self.showIndicator()
+                    self.updatePinControlWindow()
+                }
             }
         }
+
+        startCollapse()
     }
     
     private func expandWindow(isDockActivated: Bool = false, immediate: Bool = false, triggerEffects: Bool = true) {
@@ -1831,11 +2173,11 @@ class WindowSession {
         if isAnimating { return }
         if case .expanded = state { return }
         outsideCollapseCandidateSince = nil
+        let effectiveImmediate = immediate
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
         
-        guard let coords = getXCoords() else { return }
-        guard let visualHiddenX = getVisualHiddenX() else { return }
         guard let currentFrame = getWindowFrame() else { return }
+        guard let geometry = edgeGeometry(for: currentFrame) else { return }
         
         state = .expanded
         notifyTemporaryShortcutStashStateChanged(isStashed: false)
@@ -1845,14 +2187,12 @@ class WindowSession {
             effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         }
 
-        if immediate {
+        if effectiveImmediate {
             windowAnimator.stop()
             beginTargetedActivationWindow(for: 0.35)
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 0.01)
-            }
-            setWindowPosition(position: CGPoint(x: visualHiddenX, y: currentFrame.minY))
-            setWindowPosition(position: CGPoint(x: coords.expandedX, y: currentFrame.minY))
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
+            setWindowPosition(position: geometry.visualHidden)
+            setWindowPosition(position: geometry.expanded)
 
             var size = CGSize(width: lockedWidth, height: currentFrame.height)
             if let axSize = AXValueCreate(.cgSize, &size) {
@@ -1860,7 +2200,7 @@ class WindowSession {
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.012) {
-                self.setWindowPosition(position: CGPoint(x: coords.expandedX, y: currentFrame.minY))
+                self.setWindowPosition(position: geometry.expanded)
                 var secondSize = CGSize(width: self.lockedWidth, height: currentFrame.height)
                 if let axSize = AXValueCreate(.cgSize, &secondSize) {
                     AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
@@ -1869,18 +2209,16 @@ class WindowSession {
                 if let runningApp = NSRunningApplication(processIdentifier: self.pid) {
                     runningApp.activate(options: .activateIgnoringOtherApps)
                 }
-                if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                    WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-                    AppConfig.shared.removeHiddenWindowRecord(pid: self.pid, windowID: windowID)
-                }
+                self.setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
 
                 if shouldTriggerEffects {
-                    let snapEdge = self.currentEdge == 1 ? SnapEdge.left : SnapEdge.right
+                    let snapEdge = self.currentEdge == 1 ? SnapEdge.left : (self.currentEdge == 2 ? SnapEdge.right : SnapEdge.bottom)
                     let effectColor = AppConfig.shared.getColor(for: self.bundleID)
                     self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
                 }
 
                 self.isAnimating = false
+                self.indicatorWindow.alphaValue = 1.0
                 self.showIndicator()
                 self.startMouseTrackingTimer()
                 self.updatePinControlWindow()
@@ -1889,19 +2227,98 @@ class WindowSession {
             }
             return
         }
+
+        if currentEdge == 3 {
+            let hiddenPosition = geometry.hidden
+            let horizontalTarget = CGPoint(x: geometry.expanded.x, y: hiddenPosition.y)
+            let totalActivationWindow: TimeInterval = 0.8
+
+            if isDockActivated {
+                pendingDockInteraction = true
+            }
+
+            beginTargetedActivationWindow(for: totalActivationWindow)
+            suppressActivationNotifications(for: totalActivationWindow)
+            setWindowPosition(position: hiddenPosition)
+            setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: hiddenPosition, size: currentFrame.size))
+
+            if let runningApp = NSRunningApplication(processIdentifier: pid) {
+                runningApp.activate(options: .activateIgnoringOtherApps)
+            }
+
+            let snapEdge: SnapEdge = .bottom
+            let effectColor = AppConfig.shared.getColor(for: bundleID)
+            if shouldTriggerEffects {
+                triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
+            }
+
+            let startBottomVerticalExpand: (CGRect) -> Void = { [weak self] settledFrame in
+                guard let self else { return }
+                self.bottomResidualY = settledFrame.minY
+                self.animateWindowPositionFast(
+                    from: settledFrame.minX,
+                    to: geometry.expanded.x,
+                    startY: settledFrame.minY,
+                    endY: geometry.expanded.y,
+                    duration: self.standardTransitionDuration(),
+                    easeIn: false,
+                    onStart: {
+                        self.setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
+                    },
+                    completion: { [weak self] in
+                        guard let self else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            self.setWindowPosition(position: geometry.expanded)
+                            var size = CGSize(width: self.lockedWidth, height: currentFrame.height)
+                            if let axSize = AXValueCreate(.cgSize, &size) {
+                                AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
+                            }
+                        }
+                        self.isAnimating = false
+                        self.updatePinControlWindow()
+                        self.startMouseTrackingTimer()
+                        AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
+                        AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                    }
+                )
+            }
+
+            animateWindowPositionFast(
+                from: hiddenPosition.x,
+                to: horizontalTarget.x,
+                startY: hiddenPosition.y,
+                endY: horizontalTarget.y,
+                duration: standardTransitionDuration(),
+                easeIn: false,
+                onStart: {
+                    self.setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: hiddenPosition, size: currentFrame.size))
+                },
+                completion: { [weak self] in
+                    guard let self else { return }
+                    self.waitForBottomAxisToSettle(
+                        axis: .x,
+                        startValue: hiddenPosition.x,
+                        targetValue: horizontalTarget.x,
+                        minProgress: 0.82,
+                        timeout: 0.36
+                    ) { settledFrame in
+                        startBottomVerticalExpand(settledFrame)
+                    }
+                }
+            )
+            return
+        }
         
         if isDockActivated {
             pendingDockInteraction = true
             isAnimating = false 
             beginTargetedActivationWindow(for: 0.45)
-            
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-            }
-            setWindowPosition(position: CGPoint(x: coords.expandedX, y: currentFrame.minY))
+            setWindowPosition(position: geometry.visualHidden)
+            setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
+            setWindowPosition(position: geometry.expanded)
             
             // Dock 激活也同步触发特效
-            let snapEdge = currentEdge == 1 ? SnapEdge.left : SnapEdge.right
+            let snapEdge = currentEdge == 1 ? SnapEdge.left : (currentEdge == 2 ? SnapEdge.right : SnapEdge.bottom)
             let effectColor = AppConfig.shared.getColor(for: bundleID)
             if shouldTriggerEffects {
                 self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
@@ -1911,55 +2328,58 @@ class WindowSession {
             startMouseTrackingTimer()
             updatePinControlWindow()
         } else {
-            // Hover logic (Slide) - 核心修复：纯 Alpha 滑出 + 强制置顶
-            beginTargetedActivationWindow(for: 0.45)
-            
-            // 1. 先将坐标瞬移回起跑线
-            self.setWindowPosition(position: CGPoint(x: visualHiddenX, y: currentFrame.minY))
-            
-            // 2. 核心：强制置顶。利用 NSRunningApplication 激活进程，确保窗口穿透遮挡。
-            if let runningApp = NSRunningApplication(processIdentifier: pid) {
-                runningApp.activate(options: .activateIgnoringOtherApps)
-            }
-            
-            // 3. 恢复特效触发：粒子动画与射线效果
-            let snapEdge = currentEdge == 1 ? SnapEdge.left : SnapEdge.right
-            let effectColor = AppConfig.shared.getColor(for: bundleID)
-            if shouldTriggerEffects {
-                self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
-            }
-            
-            // 4. 极速启动滑出动画 (Point 2 Fix: 回拨至 0.20s)
-            self.animateWindowPositionFast(
-                from: visualHiddenX,
-                to: coords.expandedX,
-                duration: standardTransitionDuration(),
-                easeIn: false,
-                onStart: {
-                    // 动画开始的第一帧瞬间恢复可见，不再有“冲出再回弹”
-                    if let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid) {
-                        WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-                        AppConfig.shared.removeHiddenWindowRecord(pid: self.pid, windowID: windowID)
-                    }
-                },
-                completion: { [weak self] in
-                    guard let self = self else { return }
-                    // 安全降落：动画结束后 50ms 再次强化坐标与尺寸，消除宽窗口带来的 IPC 指令丢失
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        self.setWindowPosition(position: CGPoint(x: coords.expandedX, y: currentFrame.minY))
-                        var size = CGSize(width: self.lockedWidth, height: currentFrame.height)
-                        if let axSize = AXValueCreate(.cgSize, &size) {
-                            AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
-                        }
-                    }
-                    self.isAnimating = false
-                    self.updatePinControlWindow()
-                    self.startMouseTrackingTimer() 
+            // Hover logic (Slide)
+            let startHoverReveal = { [weak self] in
+                guard let self else { return }
+                self.beginTargetedActivationWindow(for: 0.45)
+                
+                // 先将坐标瞬移回起跑线
+                self.setWindowAlpha(CGFloat(self.collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
+                self.setWindowPosition(position: geometry.visualHidden)
+                
+                // 强制置顶，确保窗口从隐藏位直接接管前台交互
+                if let runningApp = NSRunningApplication(processIdentifier: self.pid) {
+                    runningApp.activate(options: .activateIgnoringOtherApps)
                 }
-            )
-            
-            AXUIElementSetAttributeValue(windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                
+                let snapEdge = self.currentEdge == 1 ? SnapEdge.left : (self.currentEdge == 2 ? SnapEdge.right : SnapEdge.bottom)
+                let effectColor = AppConfig.shared.getColor(for: self.bundleID)
+                if shouldTriggerEffects {
+                    self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
+                }
+                
+                self.animateWindowPositionFast(
+                    from: geometry.visualHidden.x,
+                    to: geometry.expanded.x,
+                    startY: geometry.visualHidden.y,
+                    endY: geometry.expanded.y,
+                    duration: self.standardTransitionDuration(),
+                    easeIn: false,
+                    onStart: {
+                        // 动画开始的第一帧瞬间恢复可见，不再有“冲出再回弹”
+                        self.setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
+                    },
+                    completion: { [weak self] in
+                        guard let self = self else { return }
+                        // 安全降落：动画结束后 50ms 再次强化坐标与尺寸，消除宽窗口带来的 IPC 指令丢失
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            self.setWindowPosition(position: geometry.expanded)
+                            var size = CGSize(width: self.lockedWidth, height: currentFrame.height)
+                            if let axSize = AXValueCreate(.cgSize, &size) {
+                                AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
+                            }
+                        }
+                        self.isAnimating = false
+                        self.updatePinControlWindow()
+                        self.startMouseTrackingTimer()
+                    }
+                )
+                
+                AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
+                AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            }
+
+            startHoverReveal()
         }
     }
     
@@ -1975,21 +2395,30 @@ class WindowSession {
         // 在屏幕上映射软件窗口的高度位置
         guard let winFrame = edgeReferenceFrame() else { return }
         let h = winFrame.height
+        let w = winFrame.width
         let currentY = winFrame.minY
-        
         let displayHeight = primaryScreenHeight
-        // Point 5: 核心重构。使用局部坐标系转换 (AX 顶端 -> AppKit 底端)
         let mappedAppKitY = displayHeight - currentY - h
-        
-        let vPadding: CGFloat = 40 // 上下各增加 40px 的透明缓冲空间，用于渲染弹动效果
-        var indFrame = NSRect(x: 0, y: mappedAppKitY - vPadding, width: 12, height: h + vPadding * 2)
-        
-        if currentEdge == 1 {
-            // 左侧：向外侧挪动 3px 以确保完全覆盖窗口暴露的 1px 边缘
-            indFrame.origin.x = displayBounds.minX - 3
+        let mappedAppKitX = winFrame.minX
+
+        let vPadding: CGFloat = 40
+        let hPadding: CGFloat = 40
+        var indFrame: NSRect
+
+        if currentEdge == 3 {
+            indFrame = NSRect(
+                x: mappedAppKitX - hPadding,
+                y: mappedAppKitY - 3,
+                width: w + hPadding * 2,
+                height: 12
+            )
         } else {
-            // 右侧：向外侧挪动 3px (宽 12，置于 maxX - 9)
-            indFrame.origin.x = displayBounds.maxX - 9
+            indFrame = NSRect(x: 0, y: mappedAppKitY - vPadding, width: 12, height: h + vPadding * 2)
+            if currentEdge == 1 {
+                indFrame.origin.x = displayBounds.minX - 3
+            } else {
+                indFrame.origin.x = displayBounds.maxX - 9
+            }
         }
         
         let opacity = AppConfig.shared.getOpacity(for: bundleID)
@@ -1998,12 +2427,14 @@ class WindowSession {
         indicatorWindow.updateColor(customColor)
         
         if let view = indicatorWindow.contentView as? SimpleColorView {
-            view.updateLayout(stripHeight: h)
+            view.updateLayout(stripLength: currentEdge == 3 ? w : h, edge: currentEdge)
             
             if animated && Date() >= indicatorAnimationSuppressionUntil {
-                // Bug 5: 提供微动画面条弹射伸展
-                // 简单保持物理特性的微动效，不再依赖 intense 参数
-                view.playSquashAndStretch(targetHeight: h)
+                if currentEdge == 3 {
+                    // 底部条的主要反馈改为方向性冲刺，不再复用默认伸展动画。
+                } else {
+                    view.playSquashAndStretch(targetLength: h)
+                }
             }
         }
         

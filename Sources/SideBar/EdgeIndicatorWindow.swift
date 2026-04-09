@@ -4,7 +4,11 @@ import SwiftUI
 class EdgeIndicatorWindow: NSPanel {
     var onMouseEntered: (() -> Void)?
     var onMouseExited: (() -> Void)?
-    var currentEdge: Int = 0 // 1 = left, 2 = right
+    var currentEdge: Int = 0 { // 1 = left, 2 = right, 3 = bottom
+        didSet {
+            (contentView as? SimpleColorView)?.currentEdge = currentEdge
+        }
+    }
     
     private var isMouseInsideVisibleStrip = false
     
@@ -94,11 +98,19 @@ class EdgeIndicatorWindow: NSPanel {
         
         let currentHeight = stripLayer.bounds.height
         let currentWidth = stripLayer.bounds.width
-        let targetScaleY = currentWidth / currentHeight
+        let scaleKeyPath: String
+        let targetScale: CGFloat
+        if lineView.currentEdge == 3 {
+            scaleKeyPath = "transform.scale.x"
+            targetScale = currentHeight / max(currentWidth, 1)
+        } else {
+            scaleKeyPath = "transform.scale.y"
+            targetScale = currentWidth / max(currentHeight, 1)
+        }
         
-        let scaleAnim = CABasicAnimation(keyPath: "transform.scale.y")
+        let scaleAnim = CABasicAnimation(keyPath: scaleKeyPath)
         scaleAnim.fromValue = 1.0
-        scaleAnim.toValue = targetScaleY
+        scaleAnim.toValue = targetScale
         
         let opacityAnim = CABasicAnimation(keyPath: "opacity")
         opacityAnim.fromValue = 1.0
@@ -129,9 +141,21 @@ class EdgeIndicatorWindow: NSPanel {
         self.orderFront(nil)
         
         stripLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        if lineView.currentEdge == 3 {
+            let fadeAnim = CABasicAnimation(keyPath: "opacity")
+            fadeAnim.fromValue = 0.0
+            fadeAnim.toValue = 1.0
+            fadeAnim.duration = 0.16
+            fadeAnim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            stripLayer.add(fadeAnim, forKey: "expandFromDotBottomFade")
+            return
+        }
         let currentHeight = stripLayer.bounds.height
         let currentWidth = stripLayer.bounds.width
-        let startScaleY = currentWidth / currentHeight
+        let scaleKeyPath: String
+        let startScale: CGFloat
+        scaleKeyPath = "transform.scale.y"
+        startScale = currentWidth / max(currentHeight, 1)
         
         let group = CAAnimationGroup()
         group.duration = 0.5
@@ -139,8 +163,8 @@ class EdgeIndicatorWindow: NSPanel {
         group.fillMode = .forwards
         group.isRemovedOnCompletion = true
         
-        let scaleAnim = CABasicAnimation(keyPath: "transform.scale.y")
-        scaleAnim.fromValue = startScaleY
+        let scaleAnim = CABasicAnimation(keyPath: scaleKeyPath)
+        scaleAnim.fromValue = startScale
         scaleAnim.toValue = 1.0
         
         let opacityAnim = CABasicAnimation(keyPath: "opacity")
@@ -151,16 +175,23 @@ class EdgeIndicatorWindow: NSPanel {
         
         stripLayer.add(group, forKey: "expandFromDot")
     }
+
+    func playBottomDirectionalImpulse(direction: CGFloat) {
+        guard let lineView = contentView as? SimpleColorView else { return }
+        lineView.playBottomDirectionalImpulse(direction: direction)
+    }
 }
 
 class SimpleColorView: NSView {
     var backgroundColorView: NSColor? {
         didSet { updateLayerState() }
     }
+    var currentEdge: Int = 1 {
+        didSet { needsLayout = true }
+    }
     
     private var stripLayer = CALayer()
-    private var stripHeight: CGFloat = 100
-    private var stripYPos: CGFloat = 0 // 新增 Y轴位置以便局部渲染
+    private var stripLength: CGFloat = 100
     
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -184,8 +215,9 @@ class SimpleColorView: NSView {
         backgroundColorView = NSColor.orange
     }
     
-    func updateLayout(stripHeight: CGFloat) {
-        self.stripHeight = stripHeight
+    func updateLayout(stripLength: CGFloat, edge: Int) {
+        self.stripLength = stripLength
+        self.currentEdge = edge
         self.needsLayout = true
     }
     
@@ -199,8 +231,14 @@ class SimpleColorView: NSView {
     }
     
     func isPointInVisibleStrip(_ point: CGPoint) -> Bool {
-        let vPadding: CGFloat = 40
-        let stripRect = CGRect(x: 0, y: vPadding, width: bounds.width, height: stripHeight)
+        let stripRect: CGRect
+        if currentEdge == 3 {
+            let hPadding: CGFloat = 40
+            stripRect = CGRect(x: hPadding, y: 0, width: stripLength, height: bounds.height)
+        } else {
+            let vPadding: CGFloat = 40
+            stripRect = CGRect(x: 0, y: vPadding, width: bounds.width, height: stripLength)
+        }
         return stripRect.contains(point)
     }
     
@@ -209,30 +247,74 @@ class SimpleColorView: NSView {
         
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        stripLayer.bounds = CGRect(x: 0, y: 0, width: 6, height: stripHeight)
-        
-        // 居中于局部 Window 即可
+        if currentEdge == 3 {
+            stripLayer.bounds = CGRect(x: 0, y: 0, width: stripLength, height: 6)
+        } else {
+            stripLayer.bounds = CGRect(x: 0, y: 0, width: 6, height: stripLength)
+        }
         stripLayer.position = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
         stripLayer.cornerRadius = 3
         CATransaction.commit()
     }
     
-    func playSquashAndStretch(targetHeight: CGFloat) {
+    func playSquashAndStretch(targetLength: CGFloat) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        stripLayer.bounds = CGRect(x: 0, y: 0, width: 6, height: targetHeight)
+        if currentEdge == 3 {
+            stripLayer.bounds = CGRect(x: 0, y: 0, width: targetLength, height: 6)
+        } else {
+            stripLayer.bounds = CGRect(x: 0, y: 0, width: 6, height: targetLength)
+        }
         stripLayer.position = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
         stripLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
         CATransaction.commit()
         
         // 使用与 LightToDo 相同的物理感缩放动画
         stripLayer.removeAnimation(forKey: "squash")
-        let scaleAnim = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        let keyPath = currentEdge == 3 ? "transform.scale.x" : "transform.scale.y"
+        let scaleAnim = CAKeyframeAnimation(keyPath: keyPath)
         scaleAnim.values = [1.0, 1.1, 0.96, 1.02, 0.99, 1.0]
         scaleAnim.keyTimes = [0, 0.15, 0.35, 0.55, 0.8, 1.0]
         scaleAnim.duration = 0.6
         scaleAnim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         stripLayer.add(scaleAnim, forKey: "squash")
+    }
+
+    func playBottomDirectionalImpulse(direction: CGFloat) {
+        guard currentEdge == 3 else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let center = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
+        stripLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        stripLayer.position = center
+        stripLayer.bounds = CGRect(x: 0, y: 0, width: stripLength, height: 6)
+        CATransaction.commit()
+
+        stripLayer.removeAnimation(forKey: "bottomDirectionalImpulse")
+
+        let overshoot = min(26, max(16, stripLength * 0.085))
+        let signedOffset = direction < 0 ? -overshoot / 2 : overshoot / 2
+
+        let widthAnim = CAKeyframeAnimation(keyPath: "bounds.size.width")
+        widthAnim.values = [stripLength, stripLength + overshoot, stripLength - overshoot * 0.12, stripLength]
+        widthAnim.keyTimes = [0.0, 0.40, 0.72, 1.0]
+
+        let positionAnim = CAKeyframeAnimation(keyPath: "position.x")
+        positionAnim.values = [center.x, center.x + signedOffset, center.x - signedOffset * 0.22, center.x]
+        positionAnim.keyTimes = [0.0, 0.40, 0.72, 1.0]
+
+        let opacityAnim = CAKeyframeAnimation(keyPath: "opacity")
+        opacityAnim.values = [1.0, 1.0, 0.97, 1.0]
+        opacityAnim.keyTimes = [0.0, 0.45, 0.72, 1.0]
+
+        let group = CAAnimationGroup()
+        group.animations = [widthAnim, positionAnim, opacityAnim]
+        group.duration = 0.26
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        group.isRemovedOnCompletion = true
+
+        stripLayer.add(group, forKey: "bottomDirectionalImpulse")
     }
     
     override func viewDidChangeEffectiveAppearance() {

@@ -614,6 +614,7 @@ struct DropdownOption {
     let title: String
     var image: NSImage? = nil
     var isSelected: Bool = false
+    var isEnabled: Bool = true
     let action: () -> Void
 }
 
@@ -653,14 +654,18 @@ private let appsColorColumnWidth: CGFloat = 120
 private let appsToggleColumnWidth: CGFloat = 56
 private let appearanceColorColumnWidth: CGFloat = 120
 private let appearanceOpacityColumnWidth: CGFloat = 92
-private let appearanceSnapColumnWidth: CGFloat = 128
+private let appearanceGlobalControlWidth: CGFloat = 176
+private let appearanceSnapColumnWidth: CGFloat = 176
 private let colorColumnTitle = "颜色".localized
 
 private let opacityOptions: [Double] = Array(0...10).map { Double($0) / 10.0 }
 private let snapSideKeys: [String] = [
-    "both",
     "left",
-    "right"
+    "right",
+    "bottom",
+    "leftRight",
+    "leftBottom",
+    "rightBottom"
 ]
 
 private func opacityDisplay(_ value: Double) -> String {
@@ -670,11 +675,87 @@ private func opacityDisplay(_ value: Double) -> String {
 private func snapSideDisplay(_ key: String) -> String {
     switch key {
     case "left":
-        return "左侧收纳".localized
+        return "仅左侧".localized
     case "right":
-        return "右侧收纳".localized
+        return "仅右侧".localized
+    case "bottom":
+        return "仅底部".localized
+    case "leftBottom":
+        return "左侧和底部".localized
+    case "rightBottom":
+        return "右侧和底部".localized
     default:
-        return "两侧均可".localized
+        return "左侧和右侧".localized
+    }
+}
+
+private func snapSideEdges(_ key: String) -> Set<String> {
+    switch key {
+    case "left":
+        return ["left"]
+    case "right":
+        return ["right"]
+    case "bottom":
+        return ["bottom"]
+    case "leftBottom":
+        return ["left", "bottom"]
+    case "rightBottom":
+        return ["right", "bottom"]
+    case "leftRightBottom":
+        return ["left", "right", "bottom"]
+    default:
+        return ["left", "right"]
+    }
+}
+
+private func isSnapSideOptionEnabled(_ key: String, blockedDockSide: String?) -> Bool {
+    guard let blockedDockSide else { return true }
+    return !snapSideEdges(key).contains(blockedDockSide)
+}
+
+private func snapSideBlockedMessage(for key: String, blockedDockSide: String?) -> String? {
+    guard let blockedDockSide, snapSideEdges(key).contains(blockedDockSide) else {
+        return nil
+    }
+
+    switch blockedDockSide {
+    case "left":
+        return "左侧被程序坞占据，涉及左侧的快照条不会生效".localized
+    case "right":
+        return "右侧被程序坞占据，涉及右侧的快照条不会生效".localized
+    case "bottom":
+        return "底部被程序坞占据，涉及底部的快照条不会生效".localized
+    default:
+        return nil
+    }
+}
+
+private func dockSideDisplay(_ side: String?) -> String {
+    switch side {
+    case "left":
+        return "左侧".localized
+    case "right":
+        return "右侧".localized
+    case "bottom":
+        return "底部".localized
+    default:
+        return "未识别".localized
+    }
+}
+
+private func dockAvoidanceModeDisplay(_ mode: DockAvoidanceMode, resolvedSide: String?) -> String {
+    switch mode {
+    case .automatic:
+        if let resolvedSide {
+            return String(format: "自动检测 · %@".localized, dockSideDisplay(resolvedSide))
+        }
+        return "自动检测".localized
+    case .left:
+        return "程序坞在左侧".localized
+    case .right:
+        return "程序坞在右侧".localized
+    case .bottom:
+        return "程序坞在底部".localized
     }
 }
 
@@ -817,45 +898,57 @@ private func makeOpacityMenuImage(
 private func makeSnapSideMenuImage(
     side: String,
     size: CGFloat = 14,
-    colorScheme: ColorScheme
+    colorScheme: ColorScheme,
+    enabled: Bool = true
 ) -> NSImage {
     let nsSize = NSSize(width: size, height: size)
     let image = NSImage(size: nsSize)
     image.lockFocus()
-    
-    let strokeColor = colorScheme == .dark ? NSColor.white : NSColor.black
-    strokeColor.setStroke()
-    
-    func drawChevron(centerX: CGFloat, pointingLeft: Bool) {
+
+    let rect = NSRect(x: 1.2, y: 1.2, width: size - 2.4, height: size - 2.4)
+    let cornerRadius = max(2.8, size * 0.22)
+    let baseStroke = colorScheme == .dark
+        ? NSColor.white.withAlphaComponent(enabled ? 0.22 : 0.12)
+        : NSColor.black.withAlphaComponent(enabled ? 0.20 : 0.10)
+    let activeStroke = NSColor.controlAccentColor.withAlphaComponent(enabled ? 0.95 : 0.28)
+
+    let outline = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
+    outline.lineWidth = 1.25
+    baseStroke.setStroke()
+    outline.stroke()
+
+    let activeEdges = snapSideEdges(side)
+    let edgeInset: CGFloat = 1.7
+
+    func strokeEdge(from start: NSPoint, to end: NSPoint) {
         let path = NSBezierPath()
-        let midY = size / 2
-        let topY = midY + 3.2
-        let bottomY = midY - 3.2
-        let span: CGFloat = 3.0
-        
-        if pointingLeft {
-            path.move(to: NSPoint(x: centerX + span, y: topY))
-            path.line(to: NSPoint(x: centerX - span, y: midY))
-            path.line(to: NSPoint(x: centerX + span, y: bottomY))
-        } else {
-            path.move(to: NSPoint(x: centerX - span, y: topY))
-            path.line(to: NSPoint(x: centerX + span, y: midY))
-            path.line(to: NSPoint(x: centerX - span, y: bottomY))
-        }
-        path.lineWidth = 1.6
+        path.move(to: start)
+        path.line(to: end)
+        path.lineWidth = 1.9
         path.lineCapStyle = .round
-        path.lineJoinStyle = .round
+        activeStroke.setStroke()
         path.stroke()
     }
-    
-    switch side {
-    case "left":
-        drawChevron(centerX: size / 2, pointingLeft: true)
-    case "right":
-        drawChevron(centerX: size / 2, pointingLeft: false)
-    default:
-        drawChevron(centerX: size / 2 - 3.0, pointingLeft: true)
-        drawChevron(centerX: size / 2 + 3.0, pointingLeft: false)
+
+    if activeEdges.contains("left") {
+        strokeEdge(
+            from: NSPoint(x: rect.minX, y: rect.minY + edgeInset),
+            to: NSPoint(x: rect.minX, y: rect.maxY - edgeInset)
+        )
+    }
+
+    if activeEdges.contains("right") {
+        strokeEdge(
+            from: NSPoint(x: rect.maxX, y: rect.minY + edgeInset),
+            to: NSPoint(x: rect.maxX, y: rect.maxY - edgeInset)
+        )
+    }
+
+    if activeEdges.contains("bottom") {
+        strokeEdge(
+            from: NSPoint(x: rect.minX + edgeInset, y: rect.minY),
+            to: NSPoint(x: rect.maxX - edgeInset, y: rect.minY)
+        )
     }
     
     image.unlockFocus()
@@ -1863,6 +1956,9 @@ struct AppearanceSettingsView: View {
     var body: some View {
         let enabledApps = appListManager.apps.filter { config.isAppEnabled(bundleID: $0.id) }
         let resolvedGlobalOpacity = currentGlobalOpacity(using: enabledApps)
+        let globalSnapSummary = currentGlobalSnapSideSummary(using: enabledApps)
+        let resolvedGlobalSnapSide = globalSnapSummary.value
+        let resolvedDockSide = config.resolvedDockAvoidanceSide()
         
         VStack(alignment: .leading, spacing: 0) {
             PaddingHeader(title: "快照条样式".localized, subtitle: "统一规划或单独调节每个启用软件快照条的色彩及透明程度。".localized)
@@ -1909,13 +2005,13 @@ struct AppearanceSettingsView: View {
                     }
                     
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("颜色与透明度".localized)
+                        Text("个性化".localized)
                             .font(.headline)
                         
                         VStack(alignment: .leading, spacing: 0) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("全局透明度覆写".localized)
+                                    Text("全局透明度".localized)
                                         .font(.headline)
                                     Text("选择此项会同时将下方所有已启用软件的透明度重置为该固定值。".localized)
                                         .font(.caption)
@@ -1924,8 +2020,9 @@ struct AppearanceSettingsView: View {
                                 Spacer()
                                 CompactMenuField(
                                     title: opacityDisplay(resolvedGlobalOpacity),
-                                    minWidth: 84,
+                                    minWidth: appearanceGlobalControlWidth,
                                     leadingImage: makeOpacityMenuImage(opacity: resolvedGlobalOpacity, colorScheme: colorScheme),
+                                    alignment: .trailing,
                                     options: opacityOptions.map { value in
                                         DropdownOption(
                                             title: opacityDisplay(value),
@@ -1936,6 +2033,88 @@ struct AppearanceSettingsView: View {
                                         }
                                     }
                                 )
+                            }
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 16)
+
+                            Divider()
+                                .padding(.horizontal, 18)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("全局吸附侧".localized)
+                                            .font(.headline)
+                                        Text("选择此项会同时将下方所有已启用软件的吸附侧重置为该固定值。".localized)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    CompactMenuField(
+                                        title: snapSideDisplay(resolvedGlobalSnapSide),
+                                        minWidth: appearanceGlobalControlWidth,
+                                        leadingImage: makeSnapSideMenuImage(side: resolvedGlobalSnapSide, colorScheme: colorScheme),
+                                        alignment: .trailing,
+                                        options: snapSideKeys.map { key in
+                                            let isEnabled = isSnapSideOptionEnabled(key, blockedDockSide: resolvedDockSide)
+                                            return DropdownOption(
+                                                title: snapSideDisplay(key),
+                                                image: makeSnapSideMenuImage(side: key, colorScheme: colorScheme, enabled: isEnabled),
+                                                isSelected: key == resolvedGlobalSnapSide,
+                                                isEnabled: isEnabled
+                                            ) {
+                                                config.setGlobalSnapSide(key)
+                                            }
+                                        }
+                                    )
+                                }
+
+                                if !globalSnapSummary.isMixed,
+                                   let warning = snapSideBlockedMessage(for: resolvedGlobalSnapSide, blockedDockSide: resolvedDockSide) {
+                                    Text(warning)
+                                        .font(.caption)
+                                        .foregroundColor(.red)
+                                }
+                            }
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 16)
+
+                            Divider()
+                                .padding(.horizontal, 18)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("程序坞位置规避".localized)
+                                            .font(.headline)
+                                        Text("自动检测程序坞位于左侧、右侧或底部，并避开该方向的快照条吸附。".localized)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        Text("如果识别不正确，可在右侧手动修改。".localized)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    CompactMenuField(
+                                        title: dockAvoidanceModeDisplay(config.dockAvoidanceMode, resolvedSide: resolvedDockSide),
+                                        minWidth: appearanceGlobalControlWidth,
+                                        alignment: .trailing,
+                                        options: DockAvoidanceMode.allCases.map { mode in
+                                            DropdownOption(
+                                                title: dockAvoidanceModeDisplay(mode, resolvedSide: resolvedDockSide),
+                                                isSelected: config.dockAvoidanceMode == mode
+                                            ) {
+                                                config.setDockAvoidanceMode(mode)
+                                            }
+                                        }
+                                    )
+                                }
+
+                                if config.dockAvoidanceMode == .automatic, resolvedDockSide == nil {
+                                    Text("当前未识别到程序坞位置，你仍然可以手动指定规避方向。".localized)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
                             }
                             .padding(.horizontal, 18)
                             .padding(.vertical, 16)
@@ -1971,7 +2150,7 @@ struct AppearanceSettingsView: View {
                                             .font(.system(size: 11, weight: .semibold))
                                             .foregroundColor(.secondary)
                                             .lineLimit(1)
-                                        HeaderHelpButton(message: "吸附侧用于限制窗口只在指定屏幕边缘触发吸附。选择左侧收纳后，窗口只有碰到左边缘才会被吸附；选择右侧收纳则相反。这个设置可以减少小屏幕或大窗口场景下的误吸附。".localized)
+                                        HeaderHelpButton(message: "吸附侧用于限制窗口只在指定屏幕边缘触发吸附。你可以组合左侧、右侧与底部；若某一侧被程序坞占据，则该侧相关组合会被禁用，并在下方显示提醒。".localized)
                                     }
                                     .padding(.leading, menuFieldTextLeadingInset)
                                     .frame(width: appearanceSnapColumnWidth, alignment: .leading)
@@ -1994,6 +2173,7 @@ struct AppearanceSettingsView: View {
                                         colorName: colorName,
                                         opacity: opacity,
                                         snapSide: snapSide,
+                                        blockedDockSide: resolvedDockSide,
                                         onColorChange: { newColor in
                                             config.updateApp(bundleID: app.id, isEnabled: true, colorName: newColor)
                                         },
@@ -2038,12 +2218,23 @@ struct AppearanceSettingsView: View {
         let allSame = enabledApps.dropFirst().allSatisfy { config.getOpacity(for: $0.id) == firstOpacity }
         return allSame ? firstOpacity : 1.0
     }
+
+    private func currentGlobalSnapSideSummary(using enabledApps: [AppInfo]) -> (value: String, isMixed: Bool) {
+        guard let firstApp = enabledApps.first else {
+            return ("leftRight", false)
+        }
+
+        let firstSnapSide = config.getSnapSide(for: firstApp.id)
+        let allSame = enabledApps.dropFirst().allSatisfy { config.getSnapSide(for: $0.id) == firstSnapSide }
+        return (allSame ? firstSnapSide : "leftRight", !allSame)
+    }
 }
 
 struct CompactMenuField: View {
     let title: String
     var minWidth: CGFloat = 96
     var leadingImage: NSImage? = nil
+    var alignment: Alignment = .leading
     let options: [DropdownOption]
     
     var body: some View {
@@ -2063,6 +2254,7 @@ struct CompactMenuField: View {
                         Text(option.title)
                     }
                 }
+                .disabled(!option.isEnabled)
             }
         } label: {
             HStack(spacing: 6) {
@@ -2077,11 +2269,11 @@ struct CompactMenuField: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: alignment)
         }
         .menuStyle(.borderlessButton)
         .hiddenMenuIndicatorIfAvailable()
-        .frame(width: minWidth, alignment: .leading)
+        .frame(width: minWidth, alignment: alignment)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.8))
         .cornerRadius(6)
     }
@@ -2220,6 +2412,7 @@ struct AppAppearanceRowView: View {
     let colorName: String
     let opacity: Double
     let snapSide: String
+    let blockedDockSide: String?
     let onColorChange: (String) -> Void
     let onOpacityChange: (Double) -> Void
     let onSnapSideChange: (String) -> Void
@@ -2238,68 +2431,79 @@ struct AppAppearanceRowView: View {
     ]
     
     var body: some View {
-        HStack(spacing: 16) {
-            HStack(spacing: 12) {
-                if let icon = app.icon {
-                    Image(nsImage: icon)
-                        .resizable()
-                        .frame(width: 32, height: 32)
-                } else {
-                    Image(systemName: "app.fill")
-                        .resizable()
-                        .frame(width: 32, height: 32)
-                        .foregroundColor(.gray)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 16) {
+                HStack(spacing: 12) {
+                    if let icon = app.icon {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "app.fill")
+                            .resizable()
+                            .frame(width: 32, height: 32)
+                            .foregroundColor(.gray)
+                    }
+                    
+                    Text(app.name)
+                        .lineLimit(1)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 
-                Text(app.name)
-                    .lineLimit(1)
+                AppearanceColorMenuField(
+                    colorName: colorName,
+                    opacity: opacity,
+                    title: getSelectedColorDisplayName(),
+                    options: colorOptions.map { option in
+                        DropdownOption(
+                            title: option.1,
+                            image: option.0 == "auto" ? generateAutoColorImage() : generateColorImage(color: option.2),
+                            isSelected: option.0 == colorName
+                        ) {
+                            onColorChange(option.0)
+                        }
+                    }
+                )
+
+                CompactMenuField(
+                    title: opacityDisplay(opacity),
+                    minWidth: appearanceOpacityColumnWidth,
+                    leadingImage: makeOpacityMenuImage(opacity: opacity, colorScheme: colorScheme),
+                    options: opacityOptions.map { value in
+                        DropdownOption(
+                            title: opacityDisplay(value),
+                            image: makeOpacityMenuImage(opacity: value, colorScheme: colorScheme),
+                            isSelected: value == opacity
+                        ) {
+                            onOpacityChange(value)
+                        }
+                    }
+                )
+
+                CompactMenuField(
+                    title: snapSideDisplay(snapSide),
+                    minWidth: appearanceSnapColumnWidth,
+                    leadingImage: makeSnapSideMenuImage(side: snapSide, colorScheme: colorScheme),
+                    options: snapSideKeys.map { key in
+                        let isEnabled = isSnapSideOptionEnabled(key, blockedDockSide: blockedDockSide)
+                        return DropdownOption(
+                            title: snapSideDisplay(key),
+                            image: makeSnapSideMenuImage(side: key, colorScheme: colorScheme, enabled: isEnabled),
+                            isSelected: key == snapSide,
+                            isEnabled: isEnabled
+                        ) {
+                            onSnapSideChange(key)
+                        }
+                    }
+                )
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            
-            AppearanceColorMenuField(
-                colorName: colorName,
-                opacity: opacity,
-                title: getSelectedColorDisplayName(),
-                options: colorOptions.map { option in
-                    DropdownOption(
-                        title: option.1,
-                        image: option.0 == "auto" ? generateAutoColorImage() : generateColorImage(color: option.2),
-                        isSelected: option.0 == colorName
-                    ) {
-                        onColorChange(option.0)
-                    }
-                }
-            )
 
-            CompactMenuField(
-                title: opacityDisplay(opacity),
-                minWidth: appearanceOpacityColumnWidth,
-                leadingImage: makeOpacityMenuImage(opacity: opacity, colorScheme: colorScheme),
-                options: opacityOptions.map { value in
-                    DropdownOption(
-                        title: opacityDisplay(value),
-                        image: makeOpacityMenuImage(opacity: value, colorScheme: colorScheme),
-                        isSelected: value == opacity
-                    ) {
-                        onOpacityChange(value)
-                    }
-                }
-            )
-
-            CompactMenuField(
-                title: snapSideDisplay(snapSide),
-                minWidth: appearanceSnapColumnWidth,
-                leadingImage: makeSnapSideMenuImage(side: snapSide, colorScheme: colorScheme),
-                options: snapSideKeys.map { key in
-                    DropdownOption(
-                        title: snapSideDisplay(key),
-                        image: makeSnapSideMenuImage(side: key, colorScheme: colorScheme),
-                        isSelected: key == snapSide
-                    ) {
-                        onSnapSideChange(key)
-                    }
-                }
-            )
+            if let warning = snapSideBlockedMessage(for: snapSide, blockedDockSide: blockedDockSide) {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .padding(.leading, 44)
+            }
         }
     }
     
