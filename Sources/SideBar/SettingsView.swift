@@ -192,10 +192,6 @@ struct SettingsSidebarItem: View {
         colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.16)
     }
 
-    private var hoverWash: Color {
-        colorScheme == .dark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
-    }
-
     private var beamLeadingInset: CGFloat { 18 }
     private var rowCornerRadius: CGFloat { 8 }
     
@@ -212,13 +208,6 @@ struct SettingsSidebarItem: View {
             ZStack(alignment: .leading) {
                 GeometryReader { proxy in
                     let beamWidth = max(proxy.size.width - beamLeadingInset, 0)
-
-                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
-                        .fill(hoverWash)
-                        .frame(width: isHovered && !isSelected ? beamWidth : 0, height: proxy.size.height)
-                        .offset(x: beamLeadingInset)
-                        .animation(transitionAnimation, value: isHovered)
-                        .animation(transitionAnimation, value: isSelected)
 
                     RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                         .fill(
@@ -265,13 +254,19 @@ struct SettingsSidebarItem: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SettingsSidebarButtonStyle())
         .frame(maxWidth: .infinity, alignment: .leading)
         .onHover { hovering in
             isHovered = hovering
         }
         .accessibilityLabel(tab.displayName)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+struct SettingsSidebarButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
     }
 }
 
