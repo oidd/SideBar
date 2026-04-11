@@ -12,6 +12,13 @@ private struct PinnedAnchor {
     let expandedMidY: CGFloat
 }
 
+private struct FocusReturnSnapshot {
+    let pid: pid_t
+    let bundleID: String
+    let windowID: CGWindowID?
+    let capturedAt: Date
+}
+
 private final class WeakWindowSessionBox {
     weak var session: WindowSession?
 
@@ -174,6 +181,7 @@ class WindowSession {
     private var indicatorAnimationSuppressionUntil: Date = .distantPast
     private var fusionReentrySuppressionUntil: Date = .distantPast
     private var focusReturnExclusionUntil: Date = .distantPast
+    private var focusReturnSnapshot: FocusReturnSnapshot?
     
     private var indicatorWindow = EdgeIndicatorWindow()
     private var effectWindow = VisualEffectOverlayWindow()
@@ -211,6 +219,7 @@ class WindowSession {
     private static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
     private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
+    private static var lastObservedFocusSnapshot: FocusReturnSnapshot?
 
     var onTemporaryShortcutSessionEnded: ((WindowSession, Bool, Bool) -> Void)?
     var onTemporaryShortcutStashStateChanged: ((WindowSession, Bool) -> Void)?
@@ -440,8 +449,89 @@ class WindowSession {
         return CGRect(origin: position, size: size)
     }
 
+    private func rememberFocusReturnTargetBeforeReveal() {
+        let sourceWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+
+        if let currentSnapshot = Self.currentFrontmostFocusSnapshot(),
+           !Self.isSnapshot(currentSnapshot, sameAsSourcePID: pid, sourceWindowID: sourceWindowID) {
+            focusReturnSnapshot = currentSnapshot
+            return
+        }
+
+        if let observedSnapshot = Self.lastObservedFocusSnapshot,
+           !Self.isSnapshot(observedSnapshot, sameAsSourcePID: pid, sourceWindowID: sourceWindowID) {
+            focusReturnSnapshot = observedSnapshot
+            return
+        }
+
+        focusReturnSnapshot = nil
+    }
+
+    static func recordObservedFocusSnapshot(for app: NSRunningApplication) {
+        guard let snapshot = focusedWindowSnapshot(for: app) else { return }
+        guard shouldStoreObservedFocusSnapshot(snapshot) else { return }
+        lastObservedFocusSnapshot = snapshot
+    }
+
+    private static func currentFrontmostFocusSnapshot() -> FocusReturnSnapshot? {
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return nil }
+        return focusedWindowSnapshot(for: frontmostApp)
+    }
+
+    private static func focusedWindowSnapshot(for app: NSRunningApplication) -> FocusReturnSnapshot? {
+        let selfBundleID = Bundle.main.bundleIdentifier ?? ""
+        guard app.activationPolicy == .regular,
+              let bundleID = app.bundleIdentifier,
+              bundleID != selfBundleID else {
+            return nil
+        }
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedValue: CFTypeRef?
+        let focusedWindow: AXUIElement?
+        if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+           let focusedWindowValue = focusedValue {
+            focusedWindow = unsafeBitCast(focusedWindowValue, to: AXUIElement.self)
+        } else {
+            focusedWindow = nil
+        }
+
+        let windowID = focusedWindow.flatMap { window in
+            WindowAlphaManager.shared.findWindowID(for: window, pid: app.processIdentifier)
+        }
+
+        return FocusReturnSnapshot(
+            pid: app.processIdentifier,
+            bundleID: bundleID,
+            windowID: windowID,
+            capturedAt: Date()
+        )
+    }
+
+    private static func shouldStoreObservedFocusSnapshot(_ snapshot: FocusReturnSnapshot) -> Bool {
+        if let windowID = snapshot.windowID,
+           shouldExcludeCandidateFromFocusReturn(windowID: windowID, ownerPID: snapshot.pid) {
+            return false
+        }
+        return true
+    }
+
+    private static func isSnapshot(
+        _ snapshot: FocusReturnSnapshot,
+        sameAsSourcePID sourcePID: pid_t,
+        sourceWindowID: CGWindowID?
+    ) -> Bool {
+        guard snapshot.pid == sourcePID else { return false }
+        guard let snapshotWindowID = snapshot.windowID,
+              let sourceWindowID else {
+            return true
+        }
+        return snapshotWindowID == sourceWindowID
+    }
+
     @objc private func handleAppActivated(_ notification: Notification) {
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        Self.recordObservedFocusSnapshot(for: app)
         if isTemporarilyPinned, app.processIdentifier != self.pid {
             if isMirrorPinActive {
                 if Self.shouldYieldPinnedWindow(to: app.processIdentifier, excluding: self) {
@@ -1074,6 +1164,7 @@ class WindowSession {
         guard Date() >= fusionReentrySuppressionUntil else { return }
         guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
+        rememberFocusReturnTargetBeforeReveal()
         let targetFrame = CGRect(
             x: geometry.expanded.x,
             y: geometry.expanded.y,
@@ -1425,14 +1516,94 @@ class WindowSession {
     private func scheduleFocusRelease(after delay: TimeInterval) {
         let sourcePID = pid
         let sourceWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+        let focusSnapshot = focusReturnSnapshot
+        focusReturnSnapshot = nil
         let preferredTargetPID = Self.preferredReleaseTargetPID(sourcePID: sourcePID, sourceWindowID: sourceWindowID)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if Self.shouldSkipScheduledFocusRestore(sourcePID: sourcePID, targetPID: focusSnapshot?.pid) {
+                return
+            }
+
+            if let focusSnapshot,
+               Self.restoreFocus(to: focusSnapshot, sourcePID: sourcePID, sourceWindowID: sourceWindowID) {
+                return
+            }
+
             Self.activateNonManagedApp(
                 preferredTargetPID: preferredTargetPID,
                 sourcePID: sourcePID,
                 sourceWindowID: sourceWindowID
             )
         }
+    }
+
+    private static func shouldSkipScheduledFocusRestore(sourcePID: pid_t, targetPID: pid_t?) -> Bool {
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return false }
+        let selfBundleID = Bundle.main.bundleIdentifier ?? ""
+
+        if frontmostApp.bundleIdentifier == selfBundleID {
+            return false
+        }
+
+        if frontmostApp.processIdentifier == sourcePID {
+            return false
+        }
+
+        if let targetPID, frontmostApp.processIdentifier == targetPID {
+            return false
+        }
+
+        return true
+    }
+
+    private static func restoreFocus(
+        to snapshot: FocusReturnSnapshot,
+        sourcePID: pid_t,
+        sourceWindowID: CGWindowID?
+    ) -> Bool {
+        let selfBundleID = Bundle.main.bundleIdentifier ?? ""
+        guard snapshot.bundleID != selfBundleID else { return false }
+        guard !isSnapshot(snapshot, sameAsSourcePID: sourcePID, sourceWindowID: sourceWindowID) else {
+            return false
+        }
+
+        if let windowID = snapshot.windowID,
+           shouldExcludeCandidateFromFocusReturn(windowID: windowID, ownerPID: snapshot.pid) {
+            return false
+        }
+
+        guard let app = NSRunningApplication(processIdentifier: snapshot.pid) else { return false }
+
+        let activated = app.activate(options: .activateIgnoringOtherApps) || app.activate()
+        guard activated else { return false }
+
+        guard let windowID = snapshot.windowID else { return true }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            let appElement = AXUIElementCreateApplication(snapshot.pid)
+            guard let matchedWindow = matchingAXWindow(in: appElement, pid: snapshot.pid, windowID: windowID) else {
+                return
+            }
+            AXUIElementSetAttributeValue(matchedWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(matchedWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        }
+
+        return true
+    }
+
+    private static func matchingAXWindow(in appElement: AXUIElement, pid: pid_t, windowID: CGWindowID) -> AXUIElement? {
+        var windowsValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+              let windows = windowsValue as? [AXUIElement] else {
+            return nil
+        }
+
+        for window in windows {
+            guard WindowAlphaManager.shared.findWindowID(for: window, pid: pid) == windowID else { continue }
+            return window
+        }
+
+        return nil
     }
 
     private static func preferredReleaseSourceIndex(
@@ -2052,6 +2223,7 @@ class WindowSession {
         
         guard let currentFrame = getWindowFrame() else { return }
         guard let geometry = edgeGeometry(for: currentFrame) else { return }
+        rememberFocusReturnTargetBeforeReveal()
         
         state = .expanded
         notifyTemporaryShortcutStashStateChanged(isStashed: false)

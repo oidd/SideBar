@@ -132,6 +132,7 @@ class AXWindowManager {
     // 允许通过 AX 通知自己回调
     func handleFocusedWindowChanged(pid: pid_t) {
         if let app = NSRunningApplication(processIdentifier: pid), let bundleID = app.bundleIdentifier {
+            WindowSession.recordObservedFocusSnapshot(for: app)
             if AppConfig.shared.isAppEnabled(bundleID: bundleID) {
                 monitorApp(pid: pid, bundleID: bundleID)
             }
