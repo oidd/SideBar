@@ -255,3 +255,6 @@ swiftc -typecheck Sources/SideBar/*.swift \
 3. 授予辅助功能权限。
 4. 在设置窗口中启用一个或多个常规 GUI 应用。
 5. 测试贴边吸附、悬停唤回、Dock 激活、快捷键以及多显示器行为。
+---------
+Friend link: I have gained many development ideas and experiences from Linux.do, and I also welcome everyone to explore the Linux.do community, https://linux.do/
+友链：我从Linux do获取了很多开发思路和经验，也欢迎小伙伴们前往Linux do的世界，https://linux.do/
