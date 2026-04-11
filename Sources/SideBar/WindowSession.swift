@@ -172,6 +172,8 @@ class WindowSession {
     private var fusionHoverLock = false
     private var activationSuppressionUntil: Date = .distantPast
     private var indicatorAnimationSuppressionUntil: Date = .distantPast
+    private var fusionReentrySuppressionUntil: Date = .distantPast
+    private var focusReturnExclusionUntil: Date = .distantPast
     
     private var indicatorWindow = EdgeIndicatorWindow()
     private var effectWindow = VisualEffectOverlayWindow()
@@ -274,6 +276,7 @@ class WindowSession {
     
     private func handleMouseEnteredIndicator() {
         if hoverCooldownActive { return } // 悬停冷却锁开启中，阻止触发
+        if Date() < fusionReentrySuppressionUntil { return }
         
         hoverDelayTimer?.invalidate()
         hoverDelayTimer = nil
@@ -467,6 +470,10 @@ class WindowSession {
                 print("📱 忽略: 程序内部触发的激活，不展开窗口")
                 return
             }
+            if Date() < fusionReentrySuppressionUntil {
+                print("📱 忽略: 该窗口正在通过融合条退场，暂不重新展开")
+                return
+            }
             if Date() < activationSuppressionUntil {
                 print("📱 忽略: 处于融合切换保护期")
                 return
@@ -491,7 +498,7 @@ class WindowSession {
                     if shouldReleaseFinderDesktopActivation() {
                         print("📱 Finder 桌面层激活，重新释放前台状态")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            Self.activateNonManagedApp()
+                            Self.activateNonManagedApp(sourcePID: self.pid)
                         }
                     }
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
@@ -532,9 +539,7 @@ class WindowSession {
                 print("📱 Dock 折叠: \(bundleID)")
                 collapseWindow()
                 // 释放前台状态：激活一个不被 SideBar 管理的应用
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    Self.activateNonManagedApp()
-                }
+                scheduleFocusRelease(after: 0.35)
             }
         }
     }
@@ -1065,6 +1070,8 @@ class WindowSession {
 
     func fusionReveal() {
         guard !isTemporarilyPinned else { return }
+        guard !isAnimating else { return }
+        guard Date() >= fusionReentrySuppressionUntil else { return }
         guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
         let targetFrame = CGRect(
@@ -1122,6 +1129,8 @@ class WindowSession {
 
     func fusionHide() {
         guard !isTemporarilyPinned else { return }
+        guard !isAnimating else { return }
+        excludeFromFocusReturn(for: 0.6)
         guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
         let hiddenFrame = CGRect(
@@ -1145,6 +1154,7 @@ class WindowSession {
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         suppressActivationNotifications(for: 0.25)
         suppressIndicatorAnimations(for: 0.4)
+        suppressFusionReentry(for: 0.45)
 
         animateWindowPositionFast(
             from: currentFrame.minX,
@@ -1212,6 +1222,14 @@ class WindowSession {
 
     private func suppressIndicatorAnimations(for duration: TimeInterval) {
         indicatorAnimationSuppressionUntil = Date().addingTimeInterval(duration)
+    }
+
+    private func suppressFusionReentry(for duration: TimeInterval) {
+        fusionReentrySuppressionUntil = Date().addingTimeInterval(duration)
+    }
+
+    private func excludeFromFocusReturn(for duration: TimeInterval) {
+        focusReturnExclusionUntil = Date().addingTimeInterval(duration)
     }
 
     private func trackedWindowIDsForAlpha(frameHint: CGRect? = nil) -> [CGWindowID] {
@@ -1383,42 +1401,211 @@ class WindowSession {
             session.suspendMirrorHoverActivation(for: duration)
         }
     }
+
+    private static func shouldExcludeCandidateFromFocusReturn(windowID: CGWindowID, ownerPID: pid_t) -> Bool {
+        cleanupRegistry()
+        let now = Date()
+        for box in sessionRegistry {
+            guard let session = box.session else { continue }
+            guard session.pid == ownerPID else { continue }
+            guard let sessionWindowID = WindowAlphaManager.shared.findWindowID(for: session.windowElement, pid: session.pid) else { continue }
+            guard sessionWindowID == windowID else { continue }
+
+            if session.focusReturnExclusionUntil > now {
+                return true
+            }
+
+            if case .snapped = session.state {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func scheduleFocusRelease(after delay: TimeInterval) {
+        let sourcePID = pid
+        let sourceWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+        let preferredTargetPID = Self.preferredReleaseTargetPID(sourcePID: sourcePID, sourceWindowID: sourceWindowID)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Self.activateNonManagedApp(
+                preferredTargetPID: preferredTargetPID,
+                sourcePID: sourcePID,
+                sourceWindowID: sourceWindowID
+            )
+        }
+    }
+
+    private static func preferredReleaseSourceIndex(
+        in windowList: [[String: Any]],
+        sourcePID: pid_t?,
+        sourceWindowID: CGWindowID?
+    ) -> Int? {
+        if let sourceWindowID {
+            for (index, info) in windowList.enumerated() {
+                guard let layer = info[kCGWindowLayer as String] as? Int,
+                      layer == 0,
+                      let windowNumber = info[kCGWindowNumber as String] as? CGWindowID,
+                      windowNumber == sourceWindowID else {
+                    continue
+                }
+                return index
+            }
+        }
+
+        if let sourcePID {
+            for (index, info) in windowList.enumerated() {
+                guard let layer = info[kCGWindowLayer as String] as? Int,
+                      layer == 0,
+                      let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                      ownerPID == sourcePID else {
+                    continue
+                }
+                return index
+            }
+        }
+
+        return nil
+    }
+
+    private static func firstEligibleReleaseTargetPID(
+        in windowList: [[String: Any]],
+        startingAfter startIndex: Int?,
+        sourcePID: pid_t?,
+        selfBundleID: String
+    ) -> pid_t? {
+        let start = (startIndex ?? -1) + 1
+        guard start < windowList.count else { return nil }
+
+        for index in start..<windowList.count {
+            let info = windowList[index]
+            guard let layer = info[kCGWindowLayer as String] as? Int,
+                  layer == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let windowID = info[kCGWindowNumber as String] as? CGWindowID else {
+                continue
+            }
+
+            if let sourcePID, pid == sourcePID { continue }
+            if shouldExcludeCandidateFromFocusReturn(windowID: windowID, ownerPID: pid) { continue }
+
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+            if alpha <= 0.05 { continue }
+
+            if let boundsDict = info[kCGWindowBounds as String] as? [String: Any] {
+                let width = boundsDict["Width"] as? CGFloat ?? 0
+                let height = boundsDict["Height"] as? CGFloat ?? 0
+                if width < 16 || height < 16 { continue }
+            }
+
+            guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+            let bundleID = app.bundleIdentifier ?? ""
+            if app.activationPolicy == .regular &&
+                !app.isHidden &&
+                bundleID != selfBundleID {
+                return pid
+            }
+        }
+
+        return nil
+    }
+
+    private static func preferredReleaseTargetPID(sourcePID: pid_t, sourceWindowID: CGWindowID?) -> pid_t? {
+        let selfBundleID = Bundle.main.bundleIdentifier ?? ""
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let sourceIndex = preferredReleaseSourceIndex(in: windowList, sourcePID: sourcePID, sourceWindowID: sourceWindowID)
+        if let pid = firstEligibleReleaseTargetPID(
+            in: windowList,
+            startingAfter: sourceIndex,
+            sourcePID: sourcePID,
+            selfBundleID: selfBundleID
+        ) {
+            return pid
+        }
+        return nil
+    }
+
+    private static func activatePreferredTarget(pid: pid_t, selfBundleID: String, sourcePID: pid_t?) -> Bool {
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in windowList {
+            guard let layer = info[kCGWindowLayer as String] as? Int,
+                  layer == 0,
+                  let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let windowID = info[kCGWindowNumber as String] as? CGWindowID,
+                  ownerPID == pid else {
+                continue
+            }
+
+            if let sourcePID, ownerPID == sourcePID { return false }
+            if shouldExcludeCandidateFromFocusReturn(windowID: windowID, ownerPID: ownerPID) { return false }
+
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+            if alpha <= 0.05 { continue }
+
+            if let boundsDict = info[kCGWindowBounds as String] as? [String: Any] {
+                let width = boundsDict["Width"] as? CGFloat ?? 0
+                let height = boundsDict["Height"] as? CGFloat ?? 0
+                if width < 16 || height < 16 { continue }
+            }
+
+            guard let app = NSRunningApplication(processIdentifier: ownerPID) else { return false }
+            let bundleID = app.bundleIdentifier ?? ""
+            guard app.activationPolicy == .regular, !app.isHidden, bundleID != selfBundleID else {
+                return false
+            }
+            app.activate()
+            return true
+        }
+
+        return false
+    }
     
     /// 激活一个不被 SideBar 管理的应用来释放前台状态
-    static func activateNonManagedApp() {
-        let managedBundleIDs = Set(AppConfig.shared.appSettings.filter { $0.value.isEnabled }.keys)
+    static func activateNonManagedApp(
+        preferredTargetPID: pid_t? = nil,
+        sourcePID: pid_t? = nil,
+        sourceWindowID: CGWindowID? = nil
+    ) {
         let selfBundleID = Bundle.main.bundleIdentifier ?? ""
+
+        if let preferredTargetPID,
+           activatePreferredTarget(pid: preferredTargetPID, selfBundleID: selfBundleID, sourcePID: sourcePID) {
+            return
+        }
         
         // 1. 获取按 Z 轴顺序从前到后的屏幕窗口列表
         let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        
-        // 2. 遍历窗口列表，寻找第一个属于 regular 且未被管理的应用程序 PID
-        for info in windowList {
-            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
-                  let pid = info[kCGWindowOwnerPID as String] as? pid_t else {
-                continue
-            }
-            
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                let bundleID = app.bundleIdentifier ?? ""
-                if app.activationPolicy == .regular &&
-                   !app.isHidden &&
-                   bundleID != selfBundleID &&
-                   !managedBundleIDs.contains(bundleID) {
-                    app.activate()
-                    return
-                }
-            }
+
+        // 2. 优先从“当前折叠窗口的下一层”开始往后找，精确把焦点交回它下面那一个应用。
+        let sourceIndex = preferredReleaseSourceIndex(in: windowList, sourcePID: sourcePID, sourceWindowID: sourceWindowID)
+        if let targetPID = firstEligibleReleaseTargetPID(
+            in: windowList,
+            startingAfter: sourceIndex,
+            sourcePID: sourcePID,
+            selfBundleID: selfBundleID
+        ), let app = NSRunningApplication(processIdentifier: targetPID) {
+            app.activate()
+            return
+        }
+
+        // 3. 如果来源窗口已经不在可见列表里，再退回“全屏最前面的未管理 regular app”。
+        if let targetPID = firstEligibleReleaseTargetPID(
+            in: windowList,
+            startingAfter: nil,
+            sourcePID: sourcePID,
+            selfBundleID: selfBundleID
+        ), let app = NSRunningApplication(processIdentifier: targetPID) {
+            app.activate()
+            return
         }
         
-        // 3. 空桌面兜底：优先交给 Dock 本身。
+        // 4. 空桌面兜底：优先交给 Dock 本身。
         // Dock 没有可展开的标准窗口，既能释放当前前台状态，又不会把 Finder 的被管理窗口误拉出来。
         if let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first,
            dock.activate(options: []) {
             return
         }
 
-        // 4. 极端兜底：如果 Dock 无法接管，再退回 Finder，但忽略这次程序内部触发的激活。
+        // 5. 极端兜底：如果 Dock 无法接管，再退回 Finder，但忽略这次程序内部触发的激活。
         if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first {
             registerProgrammaticActivationIgnore(for: finder.processIdentifier, duration: 0.45)
             finder.activate()
@@ -1524,9 +1711,7 @@ class WindowSession {
         case .expanded:
             collapseWindow()
             // 快捷键折叠后释放前台状态，确保后续可通过 Dock 唤醒
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                Self.activateNonManagedApp()
-            }
+            scheduleFocusRelease(after: 0.35)
         case .snapped:
             // 快捷键触发展开：需要豁免期保护，与 Dock 展开共用同一路径
             hasReleasedDockClick = true // 快捷键无需等待松开鼠标
@@ -1776,14 +1961,13 @@ class WindowSession {
         currentEdge = edgeConfig
         collapseWindow()
         // 首次吸附后释放前台状态，确保后续 Dock 点击能触发激活通知
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            Self.activateNonManagedApp()
-        }
+        scheduleFocusRelease(after: 0.5)
     }
     
     private func collapseWindow(immediate: Bool = false, triggerEffects: Bool = true) {
         if isTemporarilyPinned { return }
         if isAnimating { return } // 正在动画中，拒绝新指令
+        excludeFromFocusReturn(for: 0.6)
         lastCollapseTime = Date() // 记录折叠时间戳用于防抖
         outsideCollapseCandidateSince = nil
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
@@ -2091,8 +2275,8 @@ class WindowSession {
                         collapseWindow()
                         // 点击外部触发折叠后，释放前台状态
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                            guard self != nil else { return }
-                            WindowSession.activateNonManagedApp()
+                            guard let self else { return }
+                            self.scheduleFocusRelease(after: 0)
                         }
                     }
                 } else {
@@ -2118,9 +2302,7 @@ class WindowSession {
             mouseTrackingTimer?.invalidate()
             collapseWindow()
             // 鼠标移出折叠后释放前台状态，确保后续可通过 Dock 唤醒
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                Self.activateNonManagedApp()
-            }
+            scheduleFocusRelease(after: 0.35)
         } else if outsideCollapseCandidateSince == nil {
             outsideCollapseCandidateSince = now
         }

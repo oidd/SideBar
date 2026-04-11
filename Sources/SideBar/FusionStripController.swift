@@ -54,6 +54,7 @@ private struct FusionOverlayModel {
     let activeSessionID: ObjectIdentifier?
     let hoveredSessionID: ObjectIdentifier?
     let showsIcons: Bool
+    let allowsImmediateHoverSync: Bool
 }
 
 final class FusionStripCoordinator {
@@ -64,6 +65,7 @@ final class FusionStripCoordinator {
     private var hoveredSessionIDs: [FusionGroupKey: ObjectIdentifier] = [:]
     private var switchVersions: [FusionGroupKey: Int] = [:]
     private var transitionHoldUntil: [FusionGroupKey: Date] = [:]
+    private var hoverActivationArmed: [FusionGroupKey: Bool] = [:]
     private var sessionLookup: [ObjectIdentifier: WindowSession] = [:]
     private var lastSessions: [WindowSession] = []
 
@@ -123,8 +125,18 @@ final class FusionStripCoordinator {
             let overlay = overlays[group.key] ?? makeOverlay(for: group.key)
             overlays[group.key] = overlay
 
-            let preferredActiveID = models[group.key]?.activeSessionID ?? hoveredSessionIDs[group.key]
+            let previousActiveID = models[group.key]?.activeSessionID
+            let preferredActiveID = previousActiveID
             let activeSessionID = normalizeExpandedSessions(in: group.members, preferredActiveID: preferredActiveID)
+            if hoverInsideTrack[group.key] == true,
+               previousActiveID != nil,
+               activeSessionID == nil {
+                hoverActivationArmed[group.key] = false
+                hoverTimers[group.key]?.invalidate()
+                hoverTimers.removeValue(forKey: group.key)
+                hoveredSessionIDs.removeValue(forKey: group.key)
+                switchVersions[group.key, default: 0] += 1
+            }
             let model = buildOverlayModel(for: group, activeSessionID: activeSessionID)
             models[group.key] = model
             overlay.update(with: model)
@@ -139,6 +151,7 @@ final class FusionStripCoordinator {
         hoveredSessionIDs.removeAll()
         switchVersions.removeAll()
         transitionHoldUntil.removeAll()
+        hoverActivationArmed.removeAll()
         overlays.values.forEach { $0.close() }
         overlays.removeAll()
         models.removeAll()
@@ -156,6 +169,7 @@ final class FusionStripCoordinator {
     }
 
     private func handleTrackHoverChanged(_ isInside: Bool, for key: FusionGroupKey) {
+        let wasInside = hoverInsideTrack[key] == true
         hoverInsideTrack[key] = isInside
 
         if !isInside {
@@ -163,6 +177,9 @@ final class FusionStripCoordinator {
             hoverTimers.removeValue(forKey: key)
             hoveredSessionIDs.removeValue(forKey: key)
             switchVersions[key, default: 0] += 1
+            hoverActivationArmed[key] = false
+        } else if !wasInside {
+            hoverActivationArmed[key] = true
         }
 
         updateFusionLocks(for: key, enabled: isInside)
@@ -172,14 +189,22 @@ final class FusionStripCoordinator {
     private func handleHoveredSessionChange(_ sessionID: ObjectIdentifier?, for key: FusionGroupKey) {
         switchVersions[key, default: 0] += 1
         let version = switchVersions[key, default: 0]
-        hoveredSessionIDs[key] = sessionID
         hoverTimers[key]?.invalidate()
         hoverTimers.removeValue(forKey: key)
 
         guard hoverInsideTrack[key] == true, let sessionID = sessionID else {
+            hoveredSessionIDs[key] = nil
             refreshOverlay(for: key)
             return
         }
+
+        guard hoverActivationArmed[key] == true else {
+            hoveredSessionIDs[key] = nil
+            refreshOverlay(for: key)
+            return
+        }
+
+        hoveredSessionIDs[key] = sessionID
 
         let activeSessionID = models[key]?.activeSessionID
         if activeSessionID == sessionID {
@@ -210,6 +235,7 @@ final class FusionStripCoordinator {
         guard var model = models[key] else { return }
         if let expectedVersion, switchVersions[key, default: 0] != expectedVersion { return }
         guard hoverInsideTrack[key] == true else { return }
+        guard hoverActivationArmed[key] == true else { return }
         guard hoveredSessionIDs[key] == sessionID else { return }
         if sessionLookup[sessionID]?.isTemporaryPinnedForFusion() == true {
             refreshOverlay(for: key)
@@ -231,7 +257,8 @@ final class FusionStripCoordinator {
             segments: model.segments,
             activeSessionID: sessionID,
             hoveredSessionID: hoveredSessionIDs[key],
-            showsIcons: hoverInsideTrack[key] == true
+            showsIcons: hoverInsideTrack[key] == true,
+            allowsImmediateHoverSync: hoverActivationArmed[key] == true
         )
 
         models[key] = model
@@ -263,6 +290,7 @@ final class FusionStripCoordinator {
         hoverTimers.removeValue(forKey: key)
         hoveredSessionIDs.removeValue(forKey: key)
         switchVersions[key, default: 0] += 1
+        hoverActivationArmed.removeValue(forKey: key)
         if let model = models[key] {
             for memberID in model.segments.map(\.sessionID) {
                 sessionLookup[memberID]?.setFusionHoverLock(false)
@@ -282,7 +310,8 @@ final class FusionStripCoordinator {
             segments: baseModel.segments,
             activeSessionID: baseModel.activeSessionID,
             hoveredSessionID: hoveredSessionIDs[key],
-            showsIcons: hoverInsideTrack[key] == true
+            showsIcons: hoverInsideTrack[key] == true,
+            allowsImmediateHoverSync: hoverActivationArmed[key] == true
         )
 
         models[key] = refreshedModel
@@ -470,7 +499,8 @@ final class FusionStripCoordinator {
             segments: segments,
             activeSessionID: activeSessionID,
             hoveredSessionID: hoveredSessionIDs[group.key],
-            showsIcons: hoverInsideTrack[group.key] == true
+            showsIcons: hoverInsideTrack[group.key] == true,
+            allowsImmediateHoverSync: hoverActivationArmed[group.key] == true
         )
     }
 
@@ -578,7 +608,11 @@ final class FusionTrackerWindow: NSPanel {
         trackerView.model = model
         setFrame(frame, display: true)
         orderFront(nil)
-        trackerView.syncHoverStateToCurrentMouse()
+        if model.allowsImmediateHoverSync {
+            trackerView.syncHoverStateToCurrentMouse()
+        } else {
+            trackerView.resetHoverStateWithoutActivation()
+        }
     }
 }
 
@@ -814,6 +848,10 @@ private final class FusionTrackerContentView: NSView {
         guard let window else { return }
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         updateHover(with: point)
+    }
+
+    func resetHoverStateWithoutActivation() {
+        hoveredSessionID = nil
     }
 
     private func updateHover(with point: CGPoint) {
