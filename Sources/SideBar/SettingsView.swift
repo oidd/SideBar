@@ -978,19 +978,7 @@ struct GeneralSettingsView: View {
                                         .transition(.opacity)
                                 }
                             }
-                        }
-                        .padding(.leading, 8)
-                        .padding(.trailing, 16)
-                    }
-                    Divider()
-                    
-                    // 第二个大项：语言
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("语言".localized)
-                            .font(.headline)
-                            .foregroundColor(.primary)
-                        
-                        VStack(alignment: .leading, spacing: 12) {
+
                             HStack {
                                 Text("语言".localized)
                                 Spacer()
@@ -1643,6 +1631,21 @@ struct ToleranceVisualizer: View {
             Text("容忍安全区实时推演".localized)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.blue.opacity(0.15))
+                    .frame(width: 22, height: 14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .strokeBorder(style: StrokeStyle(lineWidth: 1.2, dash: [4]))
+                            .foregroundColor(Color.blue.opacity(0.5))
+                    )
+
+                Text("蓝色虚线框表示安全区".localized)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.blue.opacity(0.9))
+            }
             
             GeometryReader { geo in
                 // 窗口及比例映射设定
@@ -1668,19 +1671,6 @@ struct ToleranceVisualizer: View {
                                 Rectangle()
                                     .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4]))
                                     .foregroundColor(Color.blue.opacity(0.4))
-                            )
-                            .overlay(
-                                // 将文字改为拆分竖排行列，右贴靠外侧留白处
-                                VStack(spacing: 0) {
-                                    Text("安".localized)
-                                    Text("全".localized)
-                                    Text("区".localized)
-                                }
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(.blue.opacity(0.8))
-                                .padding(.trailing, 4)
-                                .padding(.top, safeH / 2 - 20), // 整体垂直居中居中偏上
-                                alignment: .topTrailing
                             )
                             .zIndex(1)
                         
