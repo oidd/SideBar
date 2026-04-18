@@ -6,14 +6,19 @@ class AXWindowManager {
     private let fusionCoordinator = FusionStripCoordinator()
     private var temporaryShortcutSession: WindowSession?
     private var temporarilyExcludedWindowKeys: Set<String> = []
+    private var hasCleanedUp = false
     
     // 监听应用级别的通知 (如焦点窗口变化)，跟踪新建的窗口
     private var appObservers: [pid_t: (AXObserver, CFRunLoopSource)] = [:]
     
+    private var globalMouseDownMonitor: Any?
+    private var localMouseDownMonitor: Any?
     private var globalMouseUpMonitor: Any?
     private var localMouseUpMonitor: Any?
     private var globalKeyDownMonitor: Any?
+    private var localKeyDownMonitor: Any?
     private var fusionRefreshTimer: Timer?
+    private var sessionSyncTimer: Timer?
     
     init() {
         startMonitoringAppActivation()
@@ -35,9 +40,13 @@ class AXWindowManager {
         }
         
         // 低频轮询（每 5 秒）：检测被管理应用是否已退出，自动清理残留 session
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        sessionSyncTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.synchronizeSessions()
         }
+    }
+
+    deinit {
+        cleanup()
     }
     
     func startMonitoringAppActivation() {
@@ -74,8 +83,13 @@ class AXWindowManager {
             
             // AXUIElement 失效
             var roleValue: CFTypeRef?
-            let result = AXUIElementCopyAttributeValue(session.windowElement, kAXRoleAttribute as CFString, &roleValue)
-            if result == .invalidUIElement || result == .cannotComplete {
+            let result = AccessibilityRuntimeGuard.copyAttributeValue(
+                of: session.windowElement,
+                attribute: kAXRoleAttribute as CFString,
+                value: &roleValue,
+                context: "AXWindowManager.synchronizeSessions.role"
+            )
+            if result == .invalidUIElement || result == .cannotComplete || result == .apiDisabled {
                 return true
             }
             return false
@@ -115,6 +129,9 @@ class AXWindowManager {
     }
     
     func cleanup() {
+        guard !hasCleanedUp else { return }
+        hasCleanedUp = true
+
         for session in sessions {
             session.restoreAndDestroy()
         }
@@ -122,11 +139,89 @@ class AXWindowManager {
         fusionCoordinator.tearDownAll()
         fusionRefreshTimer?.invalidate()
         fusionRefreshTimer = nil
+        sessionSyncTimer?.invalidate()
+        sessionSyncTimer = nil
         
         for (_, info) in appObservers {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
         }
         appObservers.removeAll()
+
+        if let globalMouseDownMonitor {
+            NSEvent.removeMonitor(globalMouseDownMonitor)
+            self.globalMouseDownMonitor = nil
+        }
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
+        }
+        if let globalMouseUpMonitor {
+            NSEvent.removeMonitor(globalMouseUpMonitor)
+            self.globalMouseUpMonitor = nil
+        }
+        if let localMouseUpMonitor {
+            NSEvent.removeMonitor(localMouseUpMonitor)
+            self.localMouseUpMonitor = nil
+        }
+        if let globalKeyDownMonitor {
+            NSEvent.removeMonitor(globalKeyDownMonitor)
+            self.globalKeyDownMonitor = nil
+        }
+        if let localKeyDownMonitor {
+            NSEvent.removeMonitor(localKeyDownMonitor)
+            self.localKeyDownMonitor = nil
+        }
+
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func suspendForAccessibilityLoss() {
+        guard !hasCleanedUp else { return }
+        hasCleanedUp = true
+
+        for session in sessions {
+            session.suspendForAccessibilityLoss()
+        }
+        sessions.removeAll()
+        fusionCoordinator.tearDownAll()
+        fusionRefreshTimer?.invalidate()
+        fusionRefreshTimer = nil
+        sessionSyncTimer?.invalidate()
+        sessionSyncTimer = nil
+
+        for (_, info) in appObservers {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
+        }
+        appObservers.removeAll()
+
+        if let globalMouseDownMonitor {
+            NSEvent.removeMonitor(globalMouseDownMonitor)
+            self.globalMouseDownMonitor = nil
+        }
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
+        }
+        if let globalMouseUpMonitor {
+            NSEvent.removeMonitor(globalMouseUpMonitor)
+            self.globalMouseUpMonitor = nil
+        }
+        if let localMouseUpMonitor {
+            NSEvent.removeMonitor(localMouseUpMonitor)
+            self.localMouseUpMonitor = nil
+        }
+        if let globalKeyDownMonitor {
+            NSEvent.removeMonitor(globalKeyDownMonitor)
+            self.globalKeyDownMonitor = nil
+        }
+        if let localKeyDownMonitor {
+            NSEvent.removeMonitor(localKeyDownMonitor)
+            self.localKeyDownMonitor = nil
+        }
+
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
     
     // 允许通过 AX 通知自己回调
@@ -135,6 +230,9 @@ class AXWindowManager {
             WindowSession.recordObservedFocusSnapshot(for: app)
             if AppConfig.shared.isAppEnabled(bundleID: bundleID) {
                 monitorApp(pid: pid, bundleID: bundleID)
+                sessions
+                    .filter { $0.pid == pid }
+                    .forEach { $0.handleFocusedWindowChangedWithinApp() }
             }
         }
     }
@@ -153,9 +251,21 @@ class AXWindowManager {
                     DispatchQueue.main.async { manager.handleFocusedWindowChanged(pid: pid) }
                 }
             }
-            if AXObserverCreate(pid, callback, &newObserver) == .success, let observer = newObserver {
+            if AccessibilityRuntimeGuard.createObserver(
+                pid: pid,
+                callback: callback,
+                observer: &newObserver,
+                context: "AXWindowManager.monitorApp.createObserver"
+            ) == .success, let observer = newObserver {
                 let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-                AXObserverAddNotification(observer, appElement, kAXFocusedWindowChangedNotification as CFString, selfPtr)
+                let addResult = AccessibilityRuntimeGuard.addObserverNotification(
+                    observer,
+                    element: appElement,
+                    notification: kAXFocusedWindowChangedNotification as CFString,
+                    context: "AXWindowManager.monitorApp.addFocusedWindowObserver",
+                    refcon: selfPtr
+                )
+                guard addResult == .success else { return }
                 let runLoopSource = AXObserverGetRunLoopSource(observer)
                 CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
                 appObservers[pid] = (observer, runLoopSource)
@@ -164,12 +274,22 @@ class AXWindowManager {
         
         // 获取主窗口并为其添加移动监听
         var windowValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue) == .success {
+        if AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &windowValue,
+            context: "AXWindowManager.monitorApp.focusedWindow"
+        ) == .success {
             let windowElement = windowValue as! AXUIElement
             
             // 核心修复：检查窗口子角色，排除 Finder 桌面背景 (AXDesktop) 等非标准窗口
             var subroleValue: CFTypeRef?
-            if AXUIElementCopyAttributeValue(windowElement, kAXSubroleAttribute as CFString, &subroleValue) == .success {
+            if AccessibilityRuntimeGuard.copyAttributeValue(
+                of: windowElement,
+                attribute: kAXSubroleAttribute as CFString,
+                value: &subroleValue,
+                context: "AXWindowManager.monitorApp.subrole"
+            ) == .success {
                 let subrole = subroleValue as? String ?? ""
                 if subrole != kAXStandardWindowSubrole {
                     print("⚠️ 过滤非标准窗口 (PID: \(pid), Subrole: \(subrole))，跳过监控")
@@ -203,14 +323,27 @@ class AXWindowManager {
         // 清理由于关闭等原因已经失效的旧会话（垃圾回收）
         sessions.removeAll { session in
             var roleValue: CFTypeRef?
-            let result = AXUIElementCopyAttributeValue(session.windowElement, kAXRoleAttribute as CFString, &roleValue)
-            return result == .invalidUIElement || result == .cannotComplete
+            let result = AccessibilityRuntimeGuard.copyAttributeValue(
+                of: session.windowElement,
+                attribute: kAXRoleAttribute as CFString,
+                value: &roleValue,
+                context: "AXWindowManager.monitorApp.sessionRole"
+            )
+            return result == .invalidUIElement || result == .cannotComplete || result == .apiDisabled
         }
 
         fusionCoordinator.reconcile(sessions: sessions)
     }
     
     private func setupGlobalMouseMonitor() {
+        globalMouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { _ in
+            WindowSession.noteGlobalMouseDown()
+        }
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            WindowSession.noteGlobalMouseDown()
+            return event
+        }
+
         // 监听全局鼠标左键放开
         globalMouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             self?.sessions.forEach { $0.handleMouseUp() }
@@ -221,8 +354,7 @@ class AXWindowManager {
             return event
         }
         
-        // 基础防误触记录 (WindowSession 在 AX 内会自行处理 pressedMouseButtons，这里不需干涉)
-        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { _ in }
+        // 基础防误触记录由 WindowSession 自己结合 pressedMouseButtons 处理。
     }
     
     private func setupGlobalKeyMonitor() {
@@ -231,7 +363,7 @@ class AXWindowManager {
             self?.handleGlobalKeyDown(event: event)
         }
         // 本地键盘监听（当本应用在前台时）
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if self?.handleGlobalKeyDown(event: event) == true {
                 return nil // 吃掉事件，阻止传递
             }
@@ -241,6 +373,7 @@ class AXWindowManager {
     
     @discardableResult
     private func handleGlobalKeyDown(event: NSEvent) -> Bool {
+        WindowSession.noteGlobalKeyDown(event)
         let keyCode = event.keyCode
         // 只关心修饰键中的四大标志位
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
@@ -314,14 +447,24 @@ class AXWindowManager {
         let pid = frontmostApp.processIdentifier
         let appElement = AXUIElementCreateApplication(pid)
         var windowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue) == .success,
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &windowValue,
+            context: "AXWindowManager.currentFocusedStandardWindow.focusedWindow"
+        ) == .success,
               let focusedWindow = windowValue else {
             return nil
         }
 
         let windowElement = focusedWindow as! AXUIElement
         var subroleValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(windowElement, kAXSubroleAttribute as CFString, &subroleValue) == .success,
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: windowElement,
+            attribute: kAXSubroleAttribute as CFString,
+            value: &subroleValue,
+            context: "AXWindowManager.currentFocusedStandardWindow.subrole"
+        ) == .success,
               let subrole = subroleValue as? String,
               subrole == kAXStandardWindowSubrole else {
             return nil

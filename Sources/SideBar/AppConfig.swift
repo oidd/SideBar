@@ -16,6 +16,49 @@ struct AppSettings: Codable, Equatable {
     var shortcutKeyCode: UInt16? // 键码
 }
 
+struct PersistedPoint: Codable, Equatable {
+    var x: CGFloat
+    var y: CGFloat
+
+    init(_ point: CGPoint) {
+        self.x = point.x
+        self.y = point.y
+    }
+
+    var cgPoint: CGPoint {
+        CGPoint(x: x, y: y)
+    }
+}
+
+struct PersistedRect: Codable, Equatable {
+    var x: CGFloat
+    var y: CGFloat
+    var width: CGFloat
+    var height: CGFloat
+
+    init(_ rect: CGRect) {
+        self.x = rect.origin.x
+        self.y = rect.origin.y
+        self.width = rect.width
+        self.height = rect.height
+    }
+
+    var cgRect: CGRect {
+        CGRect(x: x, y: y, width: width, height: height)
+    }
+}
+
+struct WindowRescueRecord: Codable, Equatable {
+    var bundleID: String
+    var pid: pid_t
+    var windowID: UInt32
+    var edge: Int
+    var visibleFrame: PersistedRect
+    var safeRestorePosition: PersistedPoint
+    var displayFrame: PersistedRect
+    var updatedAt: TimeInterval
+}
+
 enum DockAvoidanceMode: String, CaseIterable {
     case automatic
     case left
@@ -41,6 +84,7 @@ class AppConfig: ObservableObject {
     
     private let defaultsKey = "SideBarAppConfigurations"
     private let snapRecordsKey = "SideBarHiddenWindowRecords"
+    private let rescueRecordsKey = "SideBarWindowRescueRecords"
     private let visualEffectEnabledKey = "SideBarVisualEffectEnabled"
     private let fusionStripEnabledKey = "SideBarFusionStripEnabled"
     private let fusionOverloadWarningShownKey = "SideBarFusionOverloadWarningShown"
@@ -53,6 +97,16 @@ class AppConfig: ObservableObject {
     @Published var hiddenWindowRecords: [String] = [] {
         didSet {
             UserDefaults.standard.set(hiddenWindowRecords, forKey: snapRecordsKey)
+        }
+    }
+
+    @Published var windowRescueRecords: [WindowRescueRecord] = [] {
+        didSet {
+            if let encoded = try? JSONEncoder().encode(windowRescueRecords) {
+                UserDefaults.standard.set(encoded, forKey: rescueRecordsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: rescueRecordsKey)
+            }
         }
     }
     
@@ -164,6 +218,12 @@ class AppConfig: ObservableObject {
     
     private init() {
         self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
+        if let data = UserDefaults.standard.data(forKey: rescueRecordsKey),
+           let decoded = try? JSONDecoder().decode([WindowRescueRecord].self, from: data) {
+            self.windowRescueRecords = decoded
+        } else {
+            self.windowRescueRecords = []
+        }
         
         let savedTolerance = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverTolerance"))
         self.hoverTolerance = savedTolerance > 0
@@ -470,6 +530,36 @@ class AppConfig: ObservableObject {
     func removeHiddenWindowRecord(pid: pid_t, windowID: UInt32) {
         let record = "\(pid):\(windowID)"
         hiddenWindowRecords.removeAll { $0 == record }
+    }
+
+    func upsertWindowRescueRecord(_ record: WindowRescueRecord) {
+        if let index = windowRescueRecords.firstIndex(where: { $0.pid == record.pid && $0.windowID == record.windowID }) {
+            windowRescueRecords[index] = record
+        } else {
+            windowRescueRecords.append(record)
+        }
+    }
+
+    func removeWindowRescueRecord(pid: pid_t, windowID: UInt32) {
+        windowRescueRecords.removeAll { $0.pid == pid && $0.windowID == windowID }
+    }
+
+    func removeWindowRescueRecords(pid: pid_t, windowIDs: [UInt32]) {
+        let ids = Set(windowIDs)
+        hiddenWindowRecords.removeAll { record in
+            let parts = record.split(separator: ":")
+            guard parts.count == 2,
+                  let recordPID = pid_t(parts[0]),
+                  let recordWindowID = UInt32(parts[1]) else {
+                return false
+            }
+            return recordPID == pid && ids.contains(recordWindowID)
+        }
+        windowRescueRecords.removeAll { $0.pid == pid && ids.contains($0.windowID) }
+    }
+
+    func hasPendingWindowRescueRecords() -> Bool {
+        !windowRescueRecords.isEmpty || !hiddenWindowRecords.isEmpty
     }
     
     // MARK: - 跨应用联动 (SideBar ↔ DockMinimize)

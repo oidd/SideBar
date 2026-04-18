@@ -19,12 +19,91 @@ private struct FocusReturnSnapshot {
     let capturedAt: Date
 }
 
+private struct VisibleAppWindowSample {
+    let id: CGWindowID
+    let frame: CGRect
+}
+
+private enum GlobalClickRegion {
+    case dock
+    case menuBar
+    case content
+    case unknown
+}
+
+private struct GlobalMouseDownSample {
+    let at: Date
+    let location: CGPoint
+    let region: GlobalClickRegion
+}
+
+private enum ExplicitRevealTrigger {
+    case dockClick
+    case appSwitch
+}
+
+private struct ExplicitRevealIntent {
+    let trigger: ExplicitRevealTrigger
+    let expiresAt: Date
+}
+
 private final class WeakWindowSessionBox {
     weak var session: WindowSession?
 
     init(_ session: WindowSession) {
         self.session = session
     }
+}
+
+@discardableResult
+private func axSetBoolAttribute(
+    on element: AXUIElement,
+    attribute: CFString,
+    value: Bool,
+    context: String
+) -> AXError {
+    AccessibilityRuntimeGuard.setAttributeValue(
+        on: element,
+        attribute: attribute,
+        value: value ? kCFBooleanTrue : kCFBooleanFalse,
+        context: context
+    )
+}
+
+@discardableResult
+private func axSetPositionAttribute(
+    on element: AXUIElement,
+    position: CGPoint,
+    context: String
+) -> AXError {
+    var newPosition = position
+    guard let axValue = AXValueCreate(.cgPoint, &newPosition) else {
+        return .failure
+    }
+    return AccessibilityRuntimeGuard.setAttributeValue(
+        on: element,
+        attribute: kAXPositionAttribute as CFString,
+        value: axValue,
+        context: context
+    )
+}
+
+@discardableResult
+private func axSetSizeAttribute(
+    on element: AXUIElement,
+    size: CGSize,
+    context: String
+) -> AXError {
+    var newSize = size
+    guard let axValue = AXValueCreate(.cgSize, &newSize) else {
+        return .failure
+    }
+    return AccessibilityRuntimeGuard.setAttributeValue(
+        on: element,
+        attribute: kAXSizeAttribute as CFString,
+        value: axValue,
+        context: context
+    )
 }
 
 class WindowSession {
@@ -194,7 +273,6 @@ class WindowSession {
     private var hoverCooldownActive: Bool = false
     private var pinnedRaiseTimer: Timer?
     private var pinnedRaiseRemainingPulses: Int = 0
-    
     // 尺寸锁定：防止反馈循环导致窗口变宽
     private var lockedWidth: CGFloat = 0
     private var initialFrameCaptured = false
@@ -202,6 +280,7 @@ class WindowSession {
     private var pendingDockInteraction = false
     private var hasReleasedDockClick = false
     private var lastCollapseTime: Date = .distantPast
+    private var lastSpaceChangeAt: Date = .distantPast
     private var outsideCollapseCandidateSince: Date?
     private var lastSiblingWindowInteractionAt: Date?
     private var isTemporaryShortcutManaged = false
@@ -222,6 +301,13 @@ class WindowSession {
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
     private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
     private static var lastObservedFocusSnapshot: FocusReturnSnapshot?
+    private static var lastGlobalMouseDownAt: Date = .distantPast
+    private static var lastGlobalMouseDownSample: GlobalMouseDownSample?
+    private static var lastGlobalKeyDownAt: Date = .distantPast
+    private static var lastAppSwitchIntentAt: Date = .distantPast
+    private static var explicitRevealIntentByPID: [pid_t: ExplicitRevealIntent] = [:]
+    private static let finderDesktopRealClickWindow: TimeInterval = 0.35
+    private static let explicitRevealIntentWindow: TimeInterval = 0.55
 
     var onTemporaryShortcutSessionEnded: ((WindowSession, Bool, Bool) -> Void)?
     var onTemporaryShortcutStashStateChanged: ((WindowSession, Bool) -> Void)?
@@ -336,6 +422,8 @@ class WindowSession {
     }
     
     @objc private func handleSpaceChanged() {
+        lastSpaceChangeAt = Date()
+
         // [Space Switch Fix] 回归手工强控模式，先执行点状消散动画
         self.indicatorWindow.animateCollapseToDot { }
         
@@ -367,12 +455,11 @@ class WindowSession {
         switch state {
         case .snapped, .expanded:
             if isOnScreen {
-                if !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1 {
-                    if Date() >= indicatorAnimationSuppressionUntil {
-                        indicatorWindow.animateExpandFromDot()
-                    }
+                let wasHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
+                if wasHidden, Date() >= indicatorAnimationSuppressionUntil {
+                    indicatorWindow.animateExpandFromDot()
                 }
-                showIndicator(animated: Date() >= indicatorAnimationSuppressionUntil)
+                showIndicator(animated: wasHidden && Date() >= indicatorAnimationSuppressionUntil)
             } else {
                 indicatorWindow.orderOut(nil)
                 updatePinControlWindow()
@@ -382,6 +469,14 @@ class WindowSession {
             updatePinControlWindow()
         }
     }    
+
+    private func scheduleIndicatorVisibilityRefresh(after delay: TimeInterval = 0.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.refreshIndicatorVisibility()
+        }
+    }
+
     /// 检测当前桌面是否包含全屏应用，以决定是否隐藏指示条
     private func isInFullscreenSpace(screen: NSScreen) -> Bool {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
@@ -392,14 +487,28 @@ class WindowSession {
 
         let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
         var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &focusedValue,
+            context: "WindowSession.isInFullscreenSpace.focusedWindow"
+        ) == .success,
               let focusedWindow = focusedValue else {
             return false
         }
 
         let focusedWindowElement = focusedWindow as! AXUIElement
+        if let subrole = getAXWindowSubrole(of: focusedWindowElement),
+           subrole != kAXStandardWindowSubrole {
+            return false
+        }
         var fullscreenValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focusedWindowElement, "AXFullScreen" as CFString, &fullscreenValue) == .success else {
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: focusedWindowElement,
+            attribute: "AXFullScreen" as CFString,
+            value: &fullscreenValue,
+            context: "WindowSession.isInFullscreenSpace.fullscreen"
+        ) == .success else {
             return false
         }
 
@@ -412,13 +521,37 @@ class WindowSession {
             return false
         }
 
-        guard isFullscreen else { return false }
-        guard let focusedFrame = getAXWindowFrame(of: focusedWindowElement) else { return true }
-
         let screenBounds = cgBounds(for: screen)
-        return focusedFrame.intersects(screenBounds) &&
-            abs(focusedFrame.width - screenBounds.width) < 4 &&
-            abs(focusedFrame.height - screenBounds.height) < 4
+        guard isFullscreen else { return false }
+
+        let visibleWindows = visibleWindowsInCurrentSpace(for: frontmostApp.processIdentifier, on: screen)
+        guard !visibleWindows.isEmpty else { return false }
+
+        if let focusedWindowID = WindowAlphaManager.shared.findWindowID(for: focusedWindowElement, pid: frontmostApp.processIdentifier),
+           let matchedWindow = visibleWindows.first(where: { $0.id == focusedWindowID }) {
+            if let focusedFrame = getAXWindowFrame(of: focusedWindowElement) {
+                guard isRectApproximatelyFullscreen(focusedFrame, within: screenBounds) else {
+                    return false
+                }
+                return isRectApproximatelyFullscreen(matchedWindow.frame, within: screenBounds) &&
+                    rectsApproximatelyMatch(matchedWindow.frame, focusedFrame)
+            }
+
+            return isRectApproximatelyFullscreen(matchedWindow.frame, within: screenBounds)
+        }
+
+        guard let focusedFrame = getAXWindowFrame(of: focusedWindowElement) else {
+            return false
+        }
+
+        guard isRectApproximatelyFullscreen(focusedFrame, within: screenBounds) else {
+            return false
+        }
+
+        return visibleWindows.contains { window in
+            isRectApproximatelyFullscreen(window.frame, within: screenBounds) &&
+                rectsApproximatelyMatch(window.frame, focusedFrame)
+        }
     }
 
     private func cgBounds(for screen: NSScreen) -> CGRect {
@@ -431,11 +564,78 @@ class WindowSession {
         )
     }
 
+    private func visibleWindowsInCurrentSpace(for pid: pid_t, on screen: NSScreen) -> [VisibleAppWindowSample] {
+        let screenBounds = cgBounds(for: screen)
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+
+        return windowList.compactMap { info in
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+                  let windowID = info[kCGWindowNumber as String] as? CGWindowID,
+                  let boundsDict = info[kCGWindowBounds as String] as? [String: Any] else {
+                return nil
+            }
+
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+            guard alpha > 0.05 else { return nil }
+
+            let rect = CGRect(
+                x: boundsDict["X"] as? CGFloat ?? 0,
+                y: boundsDict["Y"] as? CGFloat ?? 0,
+                width: boundsDict["Width"] as? CGFloat ?? 0,
+                height: boundsDict["Height"] as? CGFloat ?? 0
+            )
+
+            guard rect.width >= 16, rect.height >= 16, rect.intersects(screenBounds) else {
+                return nil
+            }
+            return VisibleAppWindowSample(id: windowID, frame: rect)
+        }
+    }
+
+    private func getAXWindowSubrole(of element: AXUIElement) -> String? {
+        var subroleValue: CFTypeRef?
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: element,
+            attribute: kAXSubroleAttribute as CFString,
+            value: &subroleValue,
+            context: "WindowSession.getAXWindowSubrole.subrole"
+        ) == .success else {
+            return nil
+        }
+        return subroleValue as? String
+    }
+
+    private func isRectApproximatelyFullscreen(_ rect: CGRect, within screenBounds: CGRect) -> Bool {
+        rect.intersects(screenBounds) &&
+            abs(rect.minX - screenBounds.minX) < 6 &&
+            abs(rect.minY - screenBounds.minY) < 6 &&
+            abs(rect.width - screenBounds.width) < 6 &&
+            abs(rect.height - screenBounds.height) < 6
+    }
+
+    private func rectsApproximatelyMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) < 60 &&
+            abs(lhs.minY - rhs.minY) < 120 &&
+            abs(lhs.width - rhs.width) < 60 &&
+            abs(lhs.height - rhs.height) < 120
+    }
+
     private func getAXWindowFrame(of element: AXUIElement) -> CGRect? {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
-              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: element,
+            attribute: kAXPositionAttribute as CFString,
+            value: &positionValue,
+            context: "WindowSession.getAXWindowFrame.position"
+        ) == .success,
+              AccessibilityRuntimeGuard.copyAttributeValue(
+                of: element,
+                attribute: kAXSizeAttribute as CFString,
+                value: &sizeValue,
+                context: "WindowSession.getAXWindowFrame.size"
+              ) == .success else {
             return nil
         }
 
@@ -491,7 +691,12 @@ class WindowSession {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         var focusedValue: CFTypeRef?
         let focusedWindow: AXUIElement?
-        if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+        if AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &focusedValue,
+            context: "WindowSession.focusedWindowSnapshot.focusedWindow"
+        ) == .success,
            let focusedWindowValue = focusedValue {
             focusedWindow = unsafeBitCast(focusedWindowValue, to: AXUIElement.self)
         } else {
@@ -518,6 +723,93 @@ class WindowSession {
         return true
     }
 
+    static func noteGlobalMouseDown() {
+        let now = Date()
+        let point = NSEvent.mouseLocation
+        lastGlobalMouseDownAt = now
+        lastGlobalMouseDownSample = GlobalMouseDownSample(
+            at: now,
+            location: point,
+            region: classifyGlobalClickRegion(at: point)
+        )
+    }
+
+    static func noteGlobalKeyDown(_ event: NSEvent) {
+        let now = Date()
+        lastGlobalKeyDownAt = now
+
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers.contains(.command), event.keyCode == 48 {
+            lastAppSwitchIntentAt = now
+        }
+    }
+
+    private static func classifyGlobalClickRegion(at point: CGPoint) -> GlobalClickRegion {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) ?? NSScreen.main else {
+            return .unknown
+        }
+
+        let frame = screen.frame
+        let menuBarHeight = max(NSStatusBar.system.thickness, 28)
+        if point.y >= frame.maxY - menuBarHeight {
+            return .menuBar
+        }
+
+        guard let dockSide = AppConfig.shared.resolvedDockAvoidanceSide() else {
+            return .content
+        }
+
+        let dockThickness = estimatedDockThickness(for: frame, side: dockSide)
+        switch dockSide {
+        case "left":
+            if point.x <= frame.minX + dockThickness {
+                return .dock
+            }
+        case "right":
+            if point.x >= frame.maxX - dockThickness {
+                return .dock
+            }
+        case "bottom":
+            if point.y <= frame.minY + dockThickness {
+                return .dock
+            }
+        default:
+            break
+        }
+
+        return .content
+    }
+
+    private static func estimatedDockThickness(for screenFrame: CGRect, side: String) -> CGFloat {
+        let dockDefaults = UserDefaults(suiteName: "com.apple.dock")
+        let persistentDomain = UserDefaults.standard.persistentDomain(forName: "com.apple.dock")
+
+        let tileSizeValue = dockDefaults?.object(forKey: "tilesize") as? NSNumber
+            ?? persistentDomain?["tilesize"] as? NSNumber
+        let largeSizeValue = dockDefaults?.object(forKey: "largesize") as? NSNumber
+            ?? persistentDomain?["largesize"] as? NSNumber
+        let magnificationEnabled = (dockDefaults?.object(forKey: "magnification") as? NSNumber)?.boolValue
+            ?? (persistentDomain?["magnification"] as? NSNumber)?.boolValue
+            ?? false
+        let autohideEnabled = (dockDefaults?.object(forKey: "autohide") as? NSNumber)?.boolValue
+            ?? (persistentDomain?["autohide"] as? NSNumber)?.boolValue
+            ?? false
+
+        let tileSize = CGFloat(tileSizeValue?.doubleValue ?? 48)
+        let largeSize = CGFloat(largeSizeValue?.doubleValue ?? tileSize)
+        let iconSpan = magnificationEnabled ? max(tileSize, largeSize) : tileSize
+        let paddedThickness = iconSpan + (autohideEnabled ? 22 : 42)
+
+        let maxSpan: CGFloat
+        if side == "bottom" {
+            maxSpan = max(88, min(screenFrame.height * 0.22, 180))
+        } else {
+            maxSpan = max(88, min(screenFrame.width * 0.18, 180))
+        }
+
+        return min(max(paddedThickness, autohideEnabled ? 36 : 84), maxSpan)
+    }
+
     private static func isSnapshot(
         _ snapshot: FocusReturnSnapshot,
         sameAsSourcePID sourcePID: pid_t,
@@ -534,6 +826,14 @@ class WindowSession {
     @objc private func handleAppActivated(_ notification: Notification) {
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         Self.recordObservedFocusSnapshot(for: app)
+
+        switch state {
+        case .snapped, .expanded:
+            scheduleIndicatorVisibilityRefresh(after: 0.08)
+        case .floating:
+            break
+        }
+
         if isTemporarilyPinned, app.processIdentifier != self.pid {
             if isMirrorPinActive {
                 if Self.shouldYieldPinnedWindow(to: app.processIdentifier, excluding: self) {
@@ -574,6 +874,7 @@ class WindowSession {
                 print("📱 忽略: 这次激活被定向给同 App 的另一个窗口")
                 return
             }
+            registerExplicitRevealIntentIfNeeded()
             let isFocusedWindowSession = isCurrentFocusedWindowOfApp()
             if isMirrorPinActive {
                 hideMirrorOverlay()
@@ -587,6 +888,10 @@ class WindowSession {
             print("📱 应用激活通知: \(bundleID), 当前状态: \(state)")
             if case .snapped = state {
                 guard isFocusedWindowSession else {
+                    if isRecentExplicitFinderDesktopClick() {
+                        print("📱 Finder 桌面真实点击，保留前台，不再主动释放焦点")
+                        return
+                    }
                     if shouldReleaseFinderDesktopActivation() {
                         print("📱 Finder 桌面层激活，重新释放前台状态")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -596,14 +901,25 @@ class WindowSession {
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
                     return
                 }
+                if shouldIgnoreActivationTriggeredBySpaceSwitch() {
+                    print("📱 忽略: Space 回切导致的前台恢复，不视为 Dock 展开")
+                    releaseFocusAfterSuppressedSpaceSwitchIfNeeded()
+                    return
+                }
+                guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else {
+                    print("📱 应用被动回前台，忽略自动展开")
+                    return
+                }
                 // 防抖：如果刚折叠不到 0.5 秒，忽略此次激活通知（阻止竞态导致折叠后立刻展开）
                 if Date().timeIntervalSince(lastCollapseTime) < 0.5 {
                     print("📱 防抖: 忽略折叠后的立即展开请求")
                     return
                 }
-                print("📱 Dock 展开: \(bundleID)")
-                hasReleasedDockClick = false
-                expandWindow(isDockActivated: true)
+                let interaction = interactionFlags(for: revealIntent.trigger)
+                let triggerLabel = revealIntent.trigger == .dockClick ? "Dock" : "App Switch"
+                print("📱 \(triggerLabel) 展开: \(bundleID)")
+                hasReleasedDockClick = interaction.hasReleasedDockClick
+                expandWindow(isDockActivated: interaction.isDockActivated)
             } else if case .expanded = state {
                 guard isFocusedWindowSession else {
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
@@ -643,7 +959,7 @@ class WindowSession {
         // 如果当前正处于吸附或展开态，立即刷新指示器颜色
         if case .floating = state { return }
         print("🎨 实时同步: 检测到配置变更，刷新 \(bundleID) 侧边条颜色")
-        showIndicator()
+        showIndicator(animated: true)
         updatePinControlWindow()
     }
 
@@ -740,8 +1056,8 @@ class WindowSession {
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
             self.updatePinControlWindow()
-            AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.releaseTemporaryPin.main")
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.releaseTemporaryPin.focused")
         }
     }
 
@@ -801,8 +1117,8 @@ class WindowSession {
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
             self.updatePinControlWindow()
-            AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.releaseMirrorPin.main")
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.releaseMirrorPin.focused")
         }
     }
 
@@ -839,7 +1155,11 @@ class WindowSession {
 
     private func attemptPinnedRaise() {
         guard isTemporarilyPinned else { return }
-        let raiseResult = AXUIElementPerformAction(windowElement, kAXRaiseAction as CFString)
+        let raiseResult = AccessibilityRuntimeGuard.performAction(
+            on: windowElement,
+            action: kAXRaiseAction as CFString,
+            context: "WindowSession.attemptPinnedRaise"
+        )
         if raiseResult != .success {
             print("📌 AXRaise 失败: \(bundleID), result=\(raiseResult.rawValue)")
         }
@@ -925,8 +1245,8 @@ class WindowSession {
         if let runningApp = NSRunningApplication(processIdentifier: pid) {
             runningApp.activate(options: .activateIgnoringOtherApps)
         }
-        AXUIElementSetAttributeValue(windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.activateMirrorBackedWindow.main")
+        axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.activateMirrorBackedWindow.focused")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self else { return }
             NSAnimationContext.runAnimationGroup({ context in
@@ -972,7 +1292,12 @@ class WindowSession {
 
     private func focusedWindowOfApp() -> AXUIElement? {
         var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &focusedValue,
+            context: "WindowSession.focusedWindowOfApp.focusedWindow"
+        ) == .success,
               let focusedWindowRef = focusedValue else {
             return nil
         }
@@ -982,7 +1307,12 @@ class WindowSession {
     private func focusedWindowSubroleOfApp() -> String? {
         guard let focusedWindow = focusedWindowOfApp() else { return nil }
         var subroleValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focusedWindow, kAXSubroleAttribute as CFString, &subroleValue) == .success else {
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: focusedWindow,
+            attribute: kAXSubroleAttribute as CFString,
+            value: &subroleValue,
+            context: "WindowSession.focusedWindowSubroleOfApp.subrole"
+        ) == .success else {
             return nil
         }
         return subroleValue as? String
@@ -993,12 +1323,111 @@ class WindowSession {
         return CFEqual(focusedWindow, windowElement)
     }
 
+    private static func cleanupExplicitRevealIntents() {
+        let now = Date()
+        explicitRevealIntentByPID = explicitRevealIntentByPID.filter { $0.value.expiresAt > now }
+    }
+
+    private static func registerExplicitRevealIntent(for pid: pid_t, trigger: ExplicitRevealTrigger) {
+        cleanupExplicitRevealIntents()
+        explicitRevealIntentByPID[pid] = ExplicitRevealIntent(
+            trigger: trigger,
+            expiresAt: Date().addingTimeInterval(explicitRevealIntentWindow)
+        )
+    }
+
+    private static func peekExplicitRevealIntent(for pid: pid_t) -> ExplicitRevealIntent? {
+        cleanupExplicitRevealIntents()
+        return explicitRevealIntentByPID[pid]
+    }
+
+    private static func consumeExplicitRevealIntent(for pid: pid_t) -> ExplicitRevealIntent? {
+        guard let intent = peekExplicitRevealIntent(for: pid) else { return nil }
+        explicitRevealIntentByPID.removeValue(forKey: pid)
+        return intent
+    }
+
+    private func recentExplicitRevealTrigger() -> ExplicitRevealTrigger? {
+        if let sample = Self.lastGlobalMouseDownSample,
+           Date().timeIntervalSince(sample.at) <= Self.explicitRevealIntentWindow,
+           sample.region == .dock,
+           sample.at >= Self.lastGlobalKeyDownAt {
+            return .dockClick
+        }
+        if Date().timeIntervalSince(Self.lastAppSwitchIntentAt) <= Self.explicitRevealIntentWindow {
+            return .appSwitch
+        }
+        return nil
+    }
+
+    private func registerExplicitRevealIntentIfNeeded() {
+        guard case .snapped = state else { return }
+        guard let trigger = recentExplicitRevealTrigger() else { return }
+        Self.registerExplicitRevealIntent(for: pid, trigger: trigger)
+    }
+
+    private func interactionFlags(for trigger: ExplicitRevealTrigger) -> (isDockActivated: Bool, hasReleasedDockClick: Bool) {
+        switch trigger {
+        case .dockClick:
+            return (true, false)
+        case .appSwitch:
+            return (true, true)
+        }
+    }
+
     private func shouldReleaseFinderDesktopActivation() -> Bool {
         guard bundleID == "com.apple.finder" else { return false }
         guard case .snapped = state else { return false }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
         guard let subrole = focusedWindowSubroleOfApp() else { return true }
         return subrole != kAXStandardWindowSubrole
+    }
+
+    private func isRecentExplicitFinderDesktopClick() -> Bool {
+        guard bundleID == "com.apple.finder" else { return false }
+        guard shouldReleaseFinderDesktopActivation() else { return false }
+        guard let sample = Self.lastGlobalMouseDownSample else { return false }
+        guard Date().timeIntervalSince(sample.at) <= Self.finderDesktopRealClickWindow else { return false }
+        guard sample.region == .content else { return false }
+        guard getDisplayBounds().contains(sample.location) else { return false }
+        return true
+    }
+
+    func handleFocusedWindowChangedWithinApp() {
+        guard bundleID == "com.apple.finder" else { return }
+        guard case .snapped = state else { return }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+        guard isCurrentFocusedWindowOfApp() else { return }
+        guard Date().timeIntervalSince(lastCollapseTime) >= 0.2 else { return }
+        guard !Self.shouldIgnoreProgrammaticActivation(for: pid) else { return }
+        registerExplicitRevealIntentIfNeeded()
+        guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else {
+            print("📱 Finder 焦点回到隐藏窗口，但缺少显式唤回意图，忽略自动展开")
+            return
+        }
+
+        print("📱 Finder 焦点窗口已回到被隐藏窗口，按窗口焦点变化触发展开")
+        let interaction = interactionFlags(for: revealIntent.trigger)
+        hasReleasedDockClick = interaction.hasReleasedDockClick
+        expandWindow(isDockActivated: interaction.isDockActivated)
+    }
+
+    private func shouldIgnoreActivationTriggeredBySpaceSwitch() -> Bool {
+        guard case .snapped = state else { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastSpaceChangeAt) < 0.9 else { return false }
+        return Self.lastGlobalMouseDownAt <= lastSpaceChangeAt
+    }
+
+    private func releaseFocusAfterSuppressedSpaceSwitchIfNeeded() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { return }
+            guard case .snapped = self.state else { return }
+            guard Self.lastGlobalMouseDownAt <= self.lastSpaceChangeAt else { return }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == self.pid else { return }
+            guard Self.activateDockOnly() else { return }
+            self.scheduleIndicatorVisibilityRefresh(after: 0.08)
+        }
     }
 
     private func hasFocusedSiblingWindowOfApp() -> Bool {
@@ -1221,8 +1650,8 @@ class WindowSession {
             self.isAnimating = false
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
-            AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.fusionReveal.main")
+            axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.fusionReveal.focused")
         }
     }
 
@@ -1265,7 +1694,7 @@ class WindowSession {
         ) { [weak self] in
             guard let self else { return }
             self.forceWindowGeometry(x: hiddenFrame.minX, y: hiddenFrame.minY, height: hiddenFrame.height)
-            self.setWindowAlpha(0.01, isHidden: true)
+            self.setWindowAlpha(0.01, isHidden: true, frameHint: currentFrame)
             self.isAnimating = false
             self.showIndicator(animated: false)
         }
@@ -1338,17 +1767,67 @@ class WindowSession {
         return []
     }
 
-    private func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) {
+    private func clearTrackedWindowRecoveryState(frameHint: CGRect? = nil) {
+        let windowIDs = trackedWindowIDsForAlpha(frameHint: frameHint)
+        if windowIDs.isEmpty {
+            return
+        }
+        AppConfig.shared.removeWindowRescueRecords(pid: pid, windowIDs: windowIDs.map { $0 })
+    }
+
+    private func safeRestorePosition(for frame: CGRect) -> CGPoint {
+        let displayBounds = getDisplayBounds()
+        let winWidth = lockedWidth > 0 ? lockedWidth : frame.width
+        let safeY = frame.minY
+
+        if currentEdge == 1 {
+            return CGPoint(x: displayBounds.minX + 80, y: safeY)
+        } else {
+            return CGPoint(x: displayBounds.maxX - winWidth - 80, y: safeY)
+        }
+    }
+
+    private func persistWindowRescueRecord(windowIDs: [CGWindowID], visibleFrame: CGRect) {
+        guard currentEdge == 1 || currentEdge == 2 else { return }
+        guard let windowID = windowIDs.first else { return }
+
+        let record = WindowRescueRecord(
+            bundleID: bundleID,
+            pid: pid,
+            windowID: UInt32(windowID),
+            edge: currentEdge,
+            visibleFrame: PersistedRect(visibleFrame),
+            safeRestorePosition: PersistedPoint(safeRestorePosition(for: visibleFrame)),
+            displayFrame: PersistedRect(getDisplayBounds()),
+            updatedAt: Date().timeIntervalSince1970
+        )
+        AppConfig.shared.upsertWindowRescueRecord(record)
+    }
+
+    private func setWindowAlpha(
+        _ alpha: CGFloat,
+        isHidden: Bool,
+        frameHint: CGRect? = nil,
+        preserveRecoveryRecord: Bool = false
+    ) {
         let windowIDs = trackedWindowIDsForAlpha(frameHint: frameHint)
         guard !windowIDs.isEmpty else { return }
+
+        if isHidden, let frameHint {
+            persistWindowRescueRecord(windowIDs: windowIDs, visibleFrame: frameHint)
+        }
 
         WindowAlphaManager.shared.setAlpha(for: windowIDs, alpha: Float(alpha))
         for windowID in windowIDs {
             if isHidden {
                 AppConfig.shared.addHiddenWindowRecord(pid: self.pid, windowID: windowID)
-            } else {
+            } else if !preserveRecoveryRecord {
                 AppConfig.shared.removeHiddenWindowRecord(pid: self.pid, windowID: windowID)
             }
+        }
+
+        if !isHidden && !preserveRecoveryRecord {
+            clearTrackedWindowRecoveryState(frameHint: frameHint)
         }
     }
 
@@ -1367,10 +1846,8 @@ class WindowSession {
 
     private func forceWindowGeometry(x: CGFloat, y: CGFloat, height: CGFloat) {
         setWindowPosition(position: CGPoint(x: x, y: y))
-        var size = CGSize(width: lockedWidth, height: height)
-        if let axSize = AXValueCreate(.cgSize, &size) {
-            AXUIElementSetAttributeValue(windowElement, kAXSizeAttribute as CFString, axSize)
-        }
+        let size = CGSize(width: lockedWidth, height: height)
+        axSetSizeAttribute(on: windowElement, size: size, context: "WindowSession.forceWindowGeometry.size")
     }
 
     func restoreAndDestroy() {
@@ -1383,7 +1860,8 @@ class WindowSession {
         stopMirrorRefreshTimer()
         mirrorOverlayWindow.hide()
         setMirrorSourceWindowHidden(false)
-        setWindowAlpha(1.0, isHidden: false)
+        let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
+        setWindowAlpha(1.0, isHidden: false, frameHint: currentFrame, preserveRecoveryRecord: true)
         
         if let runningApp = NSRunningApplication(processIdentifier: pid), runningApp.isHidden {
             runningApp.unhide()
@@ -1395,20 +1873,17 @@ class WindowSession {
         
         if case .floating = state {
             // 已在可视区域，无需处理
+            clearTrackedWindowRecoveryState(frameHint: currentFrame)
         } else {
             // 核心修复：退出时将窗口完整推回屏幕内。
-            let displayBounds = getDisplayBounds()
-            let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
-            let winWidth = lockedWidth > 0 ? lockedWidth : currentFrame.width
-            
-            let safePosition: CGPoint
-            if currentEdge == 1 {
-                safePosition = CGPoint(x: displayBounds.minX + 80, y: currentFrame.minY)
-            } else { // 原在右侧
-                safePosition = CGPoint(x: displayBounds.maxX - winWidth - 80, y: currentFrame.minY)
+            let positionResult = axSetPositionAttribute(
+                on: windowElement,
+                position: safeRestorePosition(for: currentFrame),
+                context: "WindowSession.restoreAndDestroy.position"
+            )
+            if positionResult == .success {
+                clearTrackedWindowRecoveryState(frameHint: currentFrame)
             }
-            
-            setWindowPosition(position: safePosition)
         }
         destroy()
     }
@@ -1581,6 +2056,7 @@ class WindowSession {
         }
 
         guard let app = NSRunningApplication(processIdentifier: snapshot.pid) else { return false }
+        guard !app.isHidden else { return false }
 
         let activated = app.activate(options: .activateIgnoringOtherApps) || app.activate()
         guard activated else { return false }
@@ -1592,8 +2068,8 @@ class WindowSession {
             guard let matchedWindow = matchingAXWindow(in: appElement, pid: snapshot.pid, windowID: windowID) else {
                 return
             }
-            AXUIElementSetAttributeValue(matchedWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(matchedWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            axSetBoolAttribute(on: matchedWindow, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.restoreFocus.main")
+            axSetBoolAttribute(on: matchedWindow, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.restoreFocus.focused")
         }
 
         return true
@@ -1601,7 +2077,12 @@ class WindowSession {
 
     private static func matchingAXWindow(in appElement: AXUIElement, pid: pid_t, windowID: CGWindowID) -> AXUIElement? {
         var windowsValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXWindowsAttribute as CFString,
+            value: &windowsValue,
+            context: "WindowSession.matchingAXWindow.windows"
+        ) == .success,
               let windows = windowsValue as? [AXUIElement] else {
             return nil
         }
@@ -1737,6 +2218,14 @@ class WindowSession {
 
         return false
     }
+
+    @discardableResult
+    private static func activateDockOnly() -> Bool {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else {
+            return false
+        }
+        return dock.activate(options: [])
+    }
     
     /// 激活一个不被 SideBar 管理的应用来释放前台状态
     static func activateNonManagedApp(
@@ -1779,8 +2268,7 @@ class WindowSession {
         
         // 4. 空桌面兜底：优先交给 Dock 本身。
         // Dock 没有可展开的标准窗口，既能释放当前前台状态，又不会把 Finder 的被管理窗口误拉出来。
-        if let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first,
-           dock.activate(options: []) {
+        if activateDockOnly() {
             return
         }
 
@@ -1829,14 +2317,33 @@ class WindowSession {
             }
         }
         
-        if AXObserverCreate(pid, callback, &newObserver) == .success, let observer = newObserver {
+        if AccessibilityRuntimeGuard.createObserver(
+            pid: pid,
+            callback: callback,
+            observer: &newObserver,
+            context: "WindowSession.setupAXObserver.createObserver"
+        ) == .success, let observer = newObserver {
             self.axObserver = observer
             let selfPtr = Unmanaged.passUnretained(self).toOpaque()
             
-            AXObserverAddNotification(observer, windowElement, kAXWindowMovedNotification as CFString, selfPtr)
-            AXObserverAddNotification(observer, windowElement, kAXWindowResizedNotification as CFString, selfPtr)
-            AXObserverAddNotification(observer, windowElement, kAXWindowMiniaturizedNotification as CFString, selfPtr)
-            AXObserverAddNotification(observer, windowElement, kAXUIElementDestroyedNotification as CFString, selfPtr)
+            let notifications: [(CFString, String)] = [
+                (kAXWindowMovedNotification as CFString, "WindowSession.setupAXObserver.moved"),
+                (kAXWindowResizedNotification as CFString, "WindowSession.setupAXObserver.resized"),
+                (kAXWindowMiniaturizedNotification as CFString, "WindowSession.setupAXObserver.miniaturized"),
+                (kAXUIElementDestroyedNotification as CFString, "WindowSession.setupAXObserver.destroyed")
+            ]
+            for (notificationName, context) in notifications {
+                let result = AccessibilityRuntimeGuard.addObserverNotification(
+                    observer,
+                    element: windowElement,
+                    notification: notificationName,
+                    context: context,
+                    refcon: selfPtr
+                )
+                if result != .success {
+                    return
+                }
+            }
             
             self.observerRunLoopSource = AXObserverGetRunLoopSource(observer)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), self.observerRunLoopSource, .defaultMode)
@@ -1900,8 +2407,8 @@ class WindowSession {
             if let runningApp = NSRunningApplication(processIdentifier: pid) {
                 runningApp.activate(options: .activateIgnoringOtherApps)
             }
-            AXUIElementSetAttributeValue(windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.toggleExpandCollapse.main")
+            axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.toggleExpandCollapse.focused")
         case .floating:
             break
         }
@@ -2089,7 +2596,8 @@ class WindowSession {
             updatePinControlWindow()
             
             // 确保应用重启后（macOS可能会恢复其位置但初始 alpha 为 1）窗口视觉被正确隐藏
-            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: frame)
+            let visibleFrame = CGRect(x: displayBounds.minX, y: frame.minY, width: frame.width, height: frame.height)
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: visibleFrame)
         } else if shouldSnapRight {
             print("⚓ 自动收编: 检测到 \(bundleID) 在右边缘，进入吸附态")
             currentEdge = 2
@@ -2100,7 +2608,8 @@ class WindowSession {
             showIndicator()
             updatePinControlWindow()
             
-            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: frame)
+            let visibleFrame = CGRect(x: displayBounds.maxX - frame.width, y: frame.minY, width: frame.width, height: frame.height)
+            setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: visibleFrame)
         }
     }
     
@@ -2189,7 +2698,7 @@ class WindowSession {
                 triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
             }
             indicatorWindow.alphaValue = 1.0
-            showIndicator()
+            showIndicator(animated: false)
             updatePinControlWindow()
             return
         }
@@ -2217,7 +2726,7 @@ class WindowSession {
                     }
                 }
                 self.indicatorWindow.alphaValue = 1.0
-                self.showIndicator()
+                self.showIndicator(animated: false)
                 self.updatePinControlWindow()
             }
         }
@@ -2249,17 +2758,13 @@ class WindowSession {
             setWindowPosition(position: geometry.visualHidden)
             setWindowPosition(position: geometry.expanded)
 
-            var size = CGSize(width: lockedWidth, height: currentFrame.height)
-            if let axSize = AXValueCreate(.cgSize, &size) {
-                AXUIElementSetAttributeValue(windowElement, kAXSizeAttribute as CFString, axSize)
-            }
+            let size = CGSize(width: lockedWidth, height: currentFrame.height)
+            axSetSizeAttribute(on: windowElement, size: size, context: "WindowSession.expandWindow.immediate.initialSize")
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.012) {
                 self.setWindowPosition(position: geometry.expanded)
-                var secondSize = CGSize(width: self.lockedWidth, height: currentFrame.height)
-                if let axSize = AXValueCreate(.cgSize, &secondSize) {
-                    AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
-                }
+                let secondSize = CGSize(width: self.lockedWidth, height: currentFrame.height)
+                axSetSizeAttribute(on: self.windowElement, size: secondSize, context: "WindowSession.expandWindow.immediate.secondSize")
 
                 if let runningApp = NSRunningApplication(processIdentifier: self.pid) {
                     runningApp.activate(options: .activateIgnoringOtherApps)
@@ -2274,11 +2779,11 @@ class WindowSession {
 
                 self.isAnimating = false
                 self.indicatorWindow.alphaValue = 1.0
-                self.showIndicator()
+                self.showIndicator(animated: false)
                 self.startMouseTrackingTimer()
                 self.updatePinControlWindow()
-                AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.expandWindow.immediate.main")
+                axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.expandWindow.immediate.focused")
             }
             return
         }
@@ -2298,7 +2803,7 @@ class WindowSession {
                 self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
             }
             
-            showIndicator()
+            showIndicator(animated: false)
             startMouseTrackingTimer()
             updatePinControlWindow()
         } else {
@@ -2338,10 +2843,8 @@ class WindowSession {
                         // 安全降落：动画结束后 50ms 再次强化坐标与尺寸，消除宽窗口带来的 IPC 指令丢失
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                             self.setWindowPosition(position: geometry.expanded)
-                            var size = CGSize(width: self.lockedWidth, height: currentFrame.height)
-                            if let axSize = AXValueCreate(.cgSize, &size) {
-                                AXUIElementSetAttributeValue(self.windowElement, kAXSizeAttribute as CFString, axSize)
-                            }
+                            let size = CGSize(width: self.lockedWidth, height: currentFrame.height)
+                            axSetSizeAttribute(on: self.windowElement, size: size, context: "WindowSession.expandWindow.hover.safeLandingSize")
                         }
                         self.isAnimating = false
                         self.updatePinControlWindow()
@@ -2349,15 +2852,15 @@ class WindowSession {
                     }
                 )
                 
-                AXUIElementSetAttributeValue(self.windowElement, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementSetAttributeValue(self.windowElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.expandWindow.hover.main")
+                axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.expandWindow.hover.focused")
             }
 
             startHoverReveal()
         }
     }
     
-    private func showIndicator(animated: Bool = true) {
+    private func showIndicator(animated: Bool = false) {
         if isIndicatorSuppressed {
             indicatorWindow.orderOut(nil)
             updatePinControlWindow()
@@ -2540,8 +3043,18 @@ class WindowSession {
     private func getRawWindowFrame() -> CGRect? {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(windowElement, kAXPositionAttribute as CFString, &positionValue) == .success,
-           AXUIElementCopyAttributeValue(windowElement, kAXSizeAttribute as CFString, &sizeValue) == .success {
+        if AccessibilityRuntimeGuard.copyAttributeValue(
+            of: windowElement,
+            attribute: kAXPositionAttribute as CFString,
+            value: &positionValue,
+            context: "WindowSession.getRawWindowFrame.position"
+        ) == .success,
+           AccessibilityRuntimeGuard.copyAttributeValue(
+            of: windowElement,
+            attribute: kAXSizeAttribute as CFString,
+            value: &sizeValue,
+            context: "WindowSession.getRawWindowFrame.size"
+           ) == .success {
             var position: CGPoint = .zero
             var size: CGSize = .zero
             if AXValueGetValue(positionValue as! AXValue, .cgPoint, &position) &&
@@ -2587,10 +3100,31 @@ class WindowSession {
     }
     
     private func setWindowPosition(position: CGPoint) {
-        var newPosition = position
-        if let axValue = AXValueCreate(.cgPoint, &newPosition) {
-            AXUIElementSetAttributeValue(windowElement, kAXPositionAttribute as CFString, axValue)
-        }
+        axSetPositionAttribute(on: windowElement, position: position, context: "WindowSession.setWindowPosition")
+    }
+
+    func suspendForAccessibilityLoss() {
+        finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
+        isTemporarilyPinned = false
+        isMirrorPinActive = false
+        isMirrorOverlayVisible = false
+        pinnedAnchor = nil
+        stopPinnedRaisePulse()
+        stopMirrorRefreshTimer()
+        mouseTrackingTimer?.invalidate()
+        hoverDelayTimer?.invalidate()
+        hoverInterruptTimer?.invalidate()
+        pinnedRaiseTimer?.invalidate()
+        mirrorRefreshTimer?.invalidate()
+        windowAnimator.stop()
+        outsideCollapseCandidateSince = nil
+        effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
+        indicatorWindow.orderOut(nil)
+        pinControlWindow.orderOut(nil)
+        mirrorOverlayWindow.hide()
+        setMirrorSourceWindowHidden(false)
+        setWindowAlpha(1.0, isHidden: false, preserveRecoveryRecord: true)
+        destroy()
     }
 }
 
@@ -2635,10 +3169,7 @@ class WindowAnimator {
         let result = CVDisplayLinkCreateWithActiveCGDisplays(&dl)
         guard result == kCVReturnSuccess, let link = dl else {
             // fallback
-            var newPos = CGPoint(x: endX, y: endY)
-            if let axValue = AXValueCreate(.cgPoint, &newPos) {
-                AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, axValue)
-            }
+            axSetPositionAttribute(on: element, position: CGPoint(x: endX, y: endY), context: "WindowAnimator.animate.fallbackPosition")
             completion()
             return
         }
@@ -2690,17 +3221,13 @@ class WindowAnimator {
         
         if let el = element {
             // 优化：仅在必要时刻更新坐标
-            if let axPos = AXValueCreate(.cgPoint, &newPos) {
-                AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, axPos)
-            }
+            axSetPositionAttribute(on: el, position: newPos, context: "WindowAnimator.tick.position")
             
             // IPC 优化：大幅减低指令频率。不再每帧设置 Size，仅在动画开始、结束以及中途两个关键点锁定。
             // 减流方案：如果是最后一帧(finished)或者第一帧(0.0)则必设；中间过程通过大幅间隔检测减流。
             let isKeyFrame = finished || (progress == 0.0) || floor(progress * 2) != floor((progress - 0.02) * 2) 
             if isKeyFrame {
-                if let axSize = AXValueCreate(.cgSize, &newSize) {
-                    AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, axSize)
-                }
+                axSetSizeAttribute(on: el, size: newSize, context: "WindowAnimator.tick.size")
             }
             
             if !hasCalledOnStart {

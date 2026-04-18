@@ -6,18 +6,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let permissionsManager = PermissionsManager()
     var axManager: AXWindowManager?
     var settingsWindow: NSWindow?
+    private var axRuntimePausedByPermissionLoss = false
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("---------------------------------------")
         print("🚀 SideBar 已启动 - 视觉对齐与色彩同步稳定版")
         print("🛠️ 当前二进制版本构建于: 2026-02-25 23:55 (Sync & Align)") 
         print("---------------------------------------")
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAccessibilityPermissionRevoked(_:)),
+            name: .accessibilityPermissionRevoked,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAccessibilityPermissionRestored(_:)),
+            name: .accessibilityPermissionRestored,
+            object: nil
+        )
+        AccessibilityRuntimeGuard.shared.startWatchdog()
+
         setupMenuBarForEditActions()
         setupStatusBar()
-        checkPermissions()
-        
-        // 异常恢复逻辑：营救因上次崩溃/强制重启而丢失（Alpha 0）的窗口
-        rescueHiddenWindows()
+        guard checkPermissions() else { return }
+
+        // 异常恢复逻辑：营救因上次崩溃、权限丢失或强制重启遗留在边缘的窗口
+        rescueHiddenWindows(reason: "launch")
+        startAXManagerIfNeeded()
     }
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -29,6 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         print("💡 SideBar 正在退出，恢复所有隐藏或被控制的窗口...")
         axManager?.cleanup()
+        AccessibilityRuntimeGuard.shared.stopWatchdog()
     }
     
     private func setupStatusBar() {
@@ -139,7 +157,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
     
-    private func checkPermissions() {
+    @discardableResult
+    private func checkPermissions() -> Bool {
         let isTrusted = permissionsManager.isAccessibilityTrusted(prompt: true)
         if !isTrusted {
             print("未获得辅助功能权限，已弹出请求")
@@ -161,9 +180,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 NSApp.terminate(nil)
             }
+            return false
         } else {
             print("辅助功能权限正常")
-            axManager = AXWindowManager()
+            return true
+        }
+    }
+
+    private func startAXManagerIfNeeded() {
+        guard axManager == nil else { return }
+        guard AccessibilityRuntimeGuard.shared.evaluateTrustState(source: "start-ax-manager") else {
+            return
+        }
+        axRuntimePausedByPermissionLoss = false
+        axManager = AXWindowManager()
+    }
+
+    private func suspendAXManagerForPermissionLoss() {
+        guard let axManager else { return }
+        print("🛑 检测到辅助功能权限失效，暂停 AX 运行时，避免继续高频打系统。")
+        axManager.suspendForAccessibilityLoss()
+        self.axManager = nil
+        axRuntimePausedByPermissionLoss = true
+    }
+
+    @objc private func handleAccessibilityPermissionRevoked(_ notification: Notification) {
+        suspendAXManagerForPermissionLoss()
+    }
+
+    @objc private func handleAccessibilityPermissionRestored(_ notification: Notification) {
+        guard axManager == nil else { return }
+        guard axRuntimePausedByPermissionLoss else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            guard AccessibilityRuntimeGuard.shared.evaluateTrustState(source: "restore-ax-manager") else { return }
+            self.rescueHiddenWindows(reason: "permission-restored")
+            print("✅ 辅助功能权限已恢复，重新启动 AX 运行时。")
+            self.startAXManagerIfNeeded()
         }
     }
     
@@ -171,28 +225,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
     
-    private func rescueHiddenWindows() {
-        let records = AppConfig.shared.hiddenWindowRecords
-        if records.isEmpty { return }
-        
-        print("🔍 发现 \(records.count) 个潜在的离屏隐藏窗口，启动营救逻辑...")
-        
-        for record in records {
-            let parts = record.split(separator: ":")
-            guard parts.count == 2,
-                  let pid = pid_t(parts[0]),
-                  let windowID = UInt32(parts[1]) else { continue }
-            
-            // 1. 强制恢复透明度 (最关键的一步)
-            WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-            
-            // 2. 尝试激活该进程，让用户看到它已回来
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                app.activate(options: .activateIgnoringOtherApps)
-            }
+    private func rescueHiddenWindows(reason: String) {
+        guard AppConfig.shared.hasPendingWindowRescueRecords() else { return }
+
+        let hiddenCount = AppConfig.shared.hiddenWindowRecords.count
+        let detailedCount = AppConfig.shared.windowRescueRecords.count
+        print("🔍 启动窗口营救逻辑: reason=\(reason), hidden=\(hiddenCount), detailed=\(detailedCount)")
+
+        let recovered = WindowRescueManager.shared.recoverPendingWindows(reason: reason)
+        if recovered == 0 && !AccessibilityRuntimeGuard.shared.isAccessibilityTrustedCached {
+            WindowRescueManager.shared.revealPendingWindowsWithoutAccessibility(reason: reason)
         }
-        
-        // 恢复后清空记录
-        AppConfig.shared.hiddenWindowRecords.removeAll()
     }
 }
