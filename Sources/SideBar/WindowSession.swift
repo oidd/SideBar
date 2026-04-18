@@ -1599,6 +1599,7 @@ class WindowSession {
         guard !isTemporarilyPinned else { return }
         guard !isAnimating else { return }
         guard Date() >= fusionReentrySuppressionUntil else { return }
+        guard isEligibleForFusionInCurrentSpace() else { return }
         guard let geometry = edgeGeometry() else { return }
         guard let currentFrame = getWindowFrame() else { return }
         rememberFocusReturnTargetBeforeReveal()
@@ -1700,21 +1701,24 @@ class WindowSession {
         }
     }
 
-    func fusionStripDescriptor() -> FusionStripSessionDescriptor? {
-        guard currentEdge == 1 || currentEdge == 2 else { return nil }
+    func isEligibleForFusionInCurrentSpace() -> Bool {
+        guard currentEdge == 1 || currentEdge == 2 else { return false }
 
         switch state {
         case .snapped, .expanded:
             break
         case .floating:
-            return nil
+            return false
         }
 
         let screen = getScreenForWindow()
-        if isInFullscreenSpace(screen: screen) { return nil }
-        if !isIndicatorSuppressed && !fusionHoverLock {
-            guard isWindowOnScreen() else { return nil }
-        }
+        if isInFullscreenSpace(screen: screen) { return false }
+        return isWindowOnScreen()
+    }
+
+    func fusionStripDescriptor() -> FusionStripSessionDescriptor? {
+        guard isEligibleForFusionInCurrentSpace() else { return nil }
+        let screen = getScreenForWindow()
         guard let winFrame = edgeReferenceFrame() else { return nil }
 
         let displayHeight = primaryScreenHeight
@@ -2039,6 +2043,37 @@ class WindowSession {
         return true
     }
 
+    private static func isSnapshotVisibleInCurrentSpace(_ snapshot: FocusReturnSnapshot) -> Bool {
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+
+        for info in windowList {
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == snapshot.pid,
+                  let visibleWindowID = info[kCGWindowNumber as String] as? CGWindowID else {
+                continue
+            }
+
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
+            guard alpha > 0.05 else { continue }
+
+            if let boundsDict = info[kCGWindowBounds as String] as? [String: Any] {
+                let width = boundsDict["Width"] as? CGFloat ?? 0
+                let height = boundsDict["Height"] as? CGFloat ?? 0
+                guard width >= 16, height >= 16 else { continue }
+            }
+
+            if let windowID = snapshot.windowID {
+                if visibleWindowID == windowID {
+                    return true
+                }
+            } else {
+                return true
+            }
+        }
+
+        return false
+    }
+
     private static func restoreFocus(
         to snapshot: FocusReturnSnapshot,
         sourcePID: pid_t,
@@ -2054,6 +2089,8 @@ class WindowSession {
            shouldExcludeCandidateFromFocusReturn(windowID: windowID, ownerPID: snapshot.pid) {
             return false
         }
+
+        guard isSnapshotVisibleInCurrentSpace(snapshot) else { return false }
 
         guard let app = NSRunningApplication(processIdentifier: snapshot.pid) else { return false }
         guard !app.isHidden else { return false }

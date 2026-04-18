@@ -107,7 +107,11 @@ final class FusionStripCoordinator {
         let existingKeys = Set(overlays.keys)
 
         for staleKey in existingKeys.subtracting(desiredKeys) {
-            if let holdUntil = transitionHoldUntil[staleKey], holdUntil > now {
+            let shouldTearDownImmediately = models[staleKey]?.segments.contains { segment in
+                sessionLookup[segment.sessionID]?.isEligibleForFusionInCurrentSpace() != true
+            } ?? false
+            if !shouldTearDownImmediately,
+               let holdUntil = transitionHoldUntil[staleKey], holdUntil > now {
                 continue
             }
             clearInteractionState(for: staleKey)
@@ -237,6 +241,10 @@ final class FusionStripCoordinator {
         guard hoverInsideTrack[key] == true else { return }
         guard hoverActivationArmed[key] == true else { return }
         guard hoveredSessionIDs[key] == sessionID else { return }
+        guard sessionLookup[sessionID]?.isEligibleForFusionInCurrentSpace() == true else {
+            reconcile(sessions: lastSessions)
+            return
+        }
         if sessionLookup[sessionID]?.isTemporaryPinnedForFusion() == true {
             refreshOverlay(for: key)
             return
