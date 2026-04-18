@@ -203,6 +203,7 @@ class WindowSession {
     private var hasReleasedDockClick = false
     private var lastCollapseTime: Date = .distantPast
     private var outsideCollapseCandidateSince: Date?
+    private var lastSiblingWindowInteractionAt: Date?
     private var isTemporaryShortcutManaged = false
     private var isTemporarilyPinned = false
     private var isMirrorPinActive = false
@@ -216,6 +217,7 @@ class WindowSession {
     private static var sessionRegistry: [WeakWindowSessionBox] = []
     private static let mirrorHoverSuppressionInterval: TimeInterval = 0.42
     private static let siblingWindowTransitionGraceInterval: TimeInterval = 0.22
+    private static let siblingWindowPostInteractionGraceInterval: TimeInterval = 1.5
     private static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
     private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
@@ -1009,11 +1011,12 @@ class WindowSession {
         let screenBounds = getDisplayBounds()
         let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         for info in windowList {
-            guard let layer = info[kCGWindowLayer as String] as? Int,
-                  layer == 0,
-                  let boundsDict = info[kCGWindowBounds as String] as? [String: Any] else {
+            guard let boundsDict = info[kCGWindowBounds as String] as? [String: Any] else {
                 continue
             }
+
+            let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t
+            guard ownerPID == pid else { continue }
 
             let rect = CGRect(
                 x: boundsDict["X"] as? CGFloat ?? 0,
@@ -1022,7 +1025,6 @@ class WindowSession {
                 height: boundsDict["Height"] as? CGFloat ?? 0
             )
             if rect.width < 8 || rect.height < 8 { continue }
-            if !rect.contains(mousePoint) { continue }
 
             let alpha = info[kCGWindowAlpha as String] as? Double ?? 1.0
             if alpha <= 0.05 { continue }
@@ -1042,13 +1044,19 @@ class WindowSession {
                 abs(rect.width - screenBounds.width) <= 4 &&
                 abs(rect.height - screenBounds.height) <= 4
             if isScreenSizedBackground {
-                return false
+                continue
             }
 
-            let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t
-            return ownerPID == pid
+            if rect.contains(mousePoint) {
+                return true
+            }
         }
         return false
+    }
+
+    private func isWithinSiblingWindowPostInteractionGrace(_ now: Date) -> Bool {
+        guard let lastSiblingWindowInteractionAt else { return false }
+        return now.timeIntervalSince(lastSiblingWindowInteractionAt) < Self.siblingWindowPostInteractionGraceInterval
     }
 
     private func updatePinControlWindow() {
@@ -2141,6 +2149,7 @@ class WindowSession {
         excludeFromFocusReturn(for: 0.6)
         lastCollapseTime = Date() // 记录折叠时间戳用于防抖
         outsideCollapseCandidateSince = nil
+        lastSiblingWindowInteractionAt = nil
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
         
         // 必须在计算坐标前抓取最新尺寸
@@ -2417,8 +2426,10 @@ class WindowSession {
         let displayHeight = primaryScreenHeight
         let mappedMouseY = displayHeight - mouseLoc.y
         let mappedMouseLoc = CGPoint(x: mouseLoc.x, y: mappedMouseY)
+        let now = Date()
         
-        let isMouseDown = (NSEvent.pressedMouseButtons & 1 != 0)
+        let isPrimaryMouseDown = (NSEvent.pressedMouseButtons & 1 != 0)
+        let isAnyMouseDown = NSEvent.pressedMouseButtons != 0
         let tolX = AppConfig.shared.hoverTolerance
         let tolY = AppConfig.shared.hoverToleranceY
         let bufferRect = frame.insetBy(dx: -tolX, dy: -tolY)
@@ -2431,16 +2442,20 @@ class WindowSession {
         }
         let isOutside = !bufferRect.contains(mappedMouseLoc) && !pinSafeRectContainsMouse
         let isInsideSiblingWindow = isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
+        if isInsideSiblingWindow {
+            lastSiblingWindowInteractionAt = now
+        }
         let isSiblingWindowFocused =
             hasFocusedSiblingWindowOfApp() &&
             NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        let isWithinSiblingWindowGrace = isWithinSiblingWindowPostInteractionGrace(now)
 
         if pendingDockInteraction {
             if !isOutside {
                 pendingDockInteraction = false
                 outsideCollapseCandidateSince = nil
             } else {
-                if isMouseDown {
+                if isPrimaryMouseDown {
                     if hasReleasedDockClick {
                         pendingDockInteraction = false
                         mouseTrackingTimer?.invalidate()
@@ -2458,17 +2473,16 @@ class WindowSession {
             return
         }
         
-        if isMouseDown {
+        if isAnyMouseDown {
             outsideCollapseCandidateSince = nil
             return
         }
         
-        if !isOutside || isInsideSiblingWindow || isSiblingWindowFocused {
+        if !isOutside || isInsideSiblingWindow || isSiblingWindowFocused || isWithinSiblingWindowGrace {
             outsideCollapseCandidateSince = nil
             return
         }
 
-        let now = Date()
         if let since = outsideCollapseCandidateSince,
            now.timeIntervalSince(since) >= Self.siblingWindowTransitionGraceInterval {
             mouseTrackingTimer?.invalidate()

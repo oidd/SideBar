@@ -25,6 +25,9 @@ enum DockAvoidanceMode: String, CaseIterable {
 
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
+    static let defaultHoverTolerance: CGFloat = 60
+    static let maxHoverToleranceX: CGFloat = 400
+    static let maxHoverToleranceY: CGFloat = 400
     private var temporaryDockMinimizeExcludedBundleIDs: Set<String> = []
     
     // Key: Bundle ID, Value: Config
@@ -55,6 +58,11 @@ class AppConfig: ObservableObject {
     
     @Published var hoverTolerance: CGFloat = 60 {
         didSet {
+            let clamped = Self.clamp(hoverTolerance, max: Self.maxHoverToleranceX)
+            if hoverTolerance != clamped {
+                hoverTolerance = clamped
+                return
+            }
             UserDefaults.standard.set(hoverTolerance, forKey: "SideBarHoverTolerance")
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
@@ -62,6 +70,11 @@ class AppConfig: ObservableObject {
     
     @Published var hoverToleranceY: CGFloat = 60 {
         didSet {
+            let clamped = Self.clamp(hoverToleranceY, max: Self.maxHoverToleranceY)
+            if hoverToleranceY != clamped {
+                hoverToleranceY = clamped
+                return
+            }
             UserDefaults.standard.set(hoverToleranceY, forKey: "SideBarHoverToleranceY")
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
@@ -153,10 +166,14 @@ class AppConfig: ObservableObject {
         self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
         
         let savedTolerance = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverTolerance"))
-        self.hoverTolerance = savedTolerance > 0 ? savedTolerance : 60
+        self.hoverTolerance = savedTolerance > 0
+            ? Self.clamp(savedTolerance, max: Self.maxHoverToleranceX)
+            : Self.defaultHoverTolerance
         
         let savedToleranceY = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverToleranceY"))
-        self.hoverToleranceY = savedToleranceY > 0 ? savedToleranceY : 60
+        self.hoverToleranceY = savedToleranceY > 0
+            ? Self.clamp(savedToleranceY, max: Self.maxHoverToleranceY)
+            : Self.defaultHoverTolerance
         
         self.hoverDelayMS = UserDefaults.standard.integer(forKey: "SideBarHoverDelayMS")
 
@@ -257,6 +274,10 @@ class AppConfig: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
+    }
+
+    private static func clamp(_ value: CGFloat, max: CGFloat) -> CGFloat {
+        Swift.max(0, Swift.min(value, max))
     }
     
     // 全局覆盖所有已启用软件的透明度

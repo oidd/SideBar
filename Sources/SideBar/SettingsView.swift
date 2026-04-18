@@ -1494,13 +1494,19 @@ struct InteractionSettingsView: View {
                         ToleranceControlView(
                             title: "水平容差 (X轴)".localized,
                             value: $config.hoverTolerance,
-                            description: "离开窗口时，鼠标水平方向移出安全区多少像素后才触发折叠。".localized
+                            description: "离开窗口时，鼠标水平方向移出安全区多少像素后才触发折叠。".localized,
+                            range: 0...AppConfig.maxHoverToleranceX,
+                            step: 20,
+                            resetValue: AppConfig.defaultHoverTolerance
                         )
                         
                         ToleranceControlView(
                             title: "垂直容差 (Y轴)".localized,
                             value: $config.hoverToleranceY,
-                            description: "离开窗口时，鼠标垂直方向移出安全区多少像素后才触发折叠。".localized
+                            description: "离开窗口时，鼠标垂直方向移出安全区多少像素后才触发折叠。".localized,
+                            range: 0...AppConfig.maxHoverToleranceY,
+                            step: 20,
+                            resetValue: AppConfig.defaultHoverTolerance
                         )
                     }
                     .frame(width: 250)
@@ -1574,6 +1580,9 @@ struct ToleranceControlView: View {
     let title: String
     @Binding var value: CGFloat
     let description: String
+    let range: ClosedRange<CGFloat>
+    let step: CGFloat
+    let resetValue: CGFloat
     
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1593,11 +1602,11 @@ struct ToleranceControlView: View {
                 .frame(minHeight: 32, alignment: .topLeading)
             
             HStack(spacing: 12) {
-                Slider(value: $value, in: 0...200, step: 10)
+                Slider(value: $value, in: range, step: step)
                     .accentColor(.blue)
                 
                 Button(action: {
-                    value = 60
+                    value = resetValue
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.counterclockwise")
@@ -1646,10 +1655,12 @@ struct ToleranceVisualizer: View {
                 // 窗口及比例映射设定
                 let baseWindowW: CGFloat = 70
                 let baseWindowH: CGFloat = 110
-                let scale: CGFloat = 3.5 
-                
-                let scaledXTol = xTol / scale
-                let scaledYTol = yTol / scale
+                let canvasPaddingX: CGFloat = 28
+                let canvasPaddingY: CGFloat = 22
+                let availableSafeWidth = max(baseWindowW, geo.size.width - canvasPaddingX * 2)
+                let availableSafeHeight = max(baseWindowH, geo.size.height - canvasPaddingY * 2)
+                let scaledXTol = max(0, availableSafeWidth - baseWindowW) * (xTol / AppConfig.maxHoverToleranceX)
+                let scaledYTol = max(0, availableSafeHeight - baseWindowH) * 0.5 * (yTol / AppConfig.maxHoverToleranceY)
                 
                 ZStack(alignment: .leading) {
                     // 屏幕背景 - 使用更浅的灰色，增加现代感
@@ -3035,7 +3046,7 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.1"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.2"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
