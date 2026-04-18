@@ -1717,8 +1717,20 @@ class WindowSession {
     }
 
     func fusionStripDescriptor() -> FusionStripSessionDescriptor? {
-        guard isEligibleForFusionInCurrentSpace() else { return nil }
+        guard currentEdge == 1 || currentEdge == 2 else { return nil }
+
+        switch state {
+        case .snapped, .expanded:
+            break
+        case .floating:
+            return nil
+        }
+
         let screen = getScreenForWindow()
+        if isInFullscreenSpace(screen: screen) { return nil }
+        if !isIndicatorSuppressed && !fusionHoverLock {
+            guard isWindowOnScreen() else { return nil }
+        }
         guard let winFrame = edgeReferenceFrame() else { return nil }
 
         let displayHeight = primaryScreenHeight

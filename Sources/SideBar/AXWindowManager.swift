@@ -30,6 +30,7 @@ class AXWindowManager {
         
         // 监听新应用启动
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidLaunch), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         
         // 启动时同步一次所有运行中应用
         synchronizeSessions()
@@ -116,6 +117,14 @@ class AXWindowManager {
     @objc private func appDidActivate(_ notification: Notification) {
         if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             handleAppActivation(app: app)
+        }
+    }
+
+    @objc private func handleActiveSpaceDidChange() {
+        fusionCoordinator.resetForSpaceChange(sessions: sessions)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            guard let self else { return }
+            self.fusionCoordinator.reconcile(sessions: self.sessions)
         }
     }
     

@@ -161,6 +161,21 @@ final class FusionStripCoordinator {
         models.removeAll()
     }
 
+    func resetForSpaceChange(sessions: [WindowSession]) {
+        for key in Array(models.keys) {
+            clearInteractionState(for: key)
+        }
+        overlays.values.forEach { $0.close() }
+        overlays.removeAll()
+        models.removeAll()
+        transitionHoldUntil.removeAll()
+
+        sessions.forEach {
+            $0.setIndicatorSuppressed(false)
+            $0.setFusionHoverLock(false)
+        }
+    }
+
     private func makeOverlay(for key: FusionGroupKey) -> FusionIndicatorWindow {
         let overlay = FusionIndicatorWindow()
         overlay.onTrackHoverChanged = { [weak self] isInside in
