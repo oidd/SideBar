@@ -3046,7 +3046,7 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.2"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.3"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
