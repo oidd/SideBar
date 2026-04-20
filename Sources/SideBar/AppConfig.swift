@@ -66,6 +66,12 @@ enum DockAvoidanceMode: String, CaseIterable {
     case bottom
 }
 
+enum UpdateCheckFrequency: Int, CaseIterable {
+    case never = 0
+    case everyLaunch = 1
+    case weekly = 2
+}
+
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
     static let defaultHoverTolerance: CGFloat = 60
@@ -92,6 +98,8 @@ class AppConfig: ObservableObject {
     private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
     private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
     private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
+    private let updateCheckFrequencyKey = "SideBarUpdateCheckFrequency"
+    private let lastSuccessfulUpdateCheckAtKey = "SideBarLastSuccessfulUpdateCheckAt"
     
     // 格式: "PID:WindowID"
     @Published var hiddenWindowRecords: [String] = [] {
@@ -215,6 +223,19 @@ class AppConfig: ObservableObject {
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
     }
+
+    @Published var updateCheckFrequencyRawValue: Int = UpdateCheckFrequency.weekly.rawValue {
+        didSet {
+            let normalized = UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue)?.rawValue ?? UpdateCheckFrequency.weekly.rawValue
+            if updateCheckFrequencyRawValue != normalized {
+                updateCheckFrequencyRawValue = normalized
+                return
+            }
+            UserDefaults.standard.set(normalized, forKey: updateCheckFrequencyKey)
+        }
+    }
+
+    private var lastSuccessfulUpdateCheckAt: TimeInterval = 0
     
     private init() {
         self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
@@ -301,6 +322,16 @@ class AppConfig: ObservableObject {
             self.dockAvoidanceModeRawValue = DockAvoidanceMode.automatic.rawValue
             UserDefaults.standard.set(DockAvoidanceMode.automatic.rawValue, forKey: dockAvoidanceModeKey)
         }
+
+        if let savedFrequency = UpdateCheckFrequency(rawValue: UserDefaults.standard.integer(forKey: updateCheckFrequencyKey)),
+           UserDefaults.standard.object(forKey: updateCheckFrequencyKey) != nil {
+            self.updateCheckFrequencyRawValue = savedFrequency.rawValue
+        } else {
+            self.updateCheckFrequencyRawValue = UpdateCheckFrequency.weekly.rawValue
+            UserDefaults.standard.set(UpdateCheckFrequency.weekly.rawValue, forKey: updateCheckFrequencyKey)
+        }
+
+        self.lastSuccessfulUpdateCheckAt = UserDefaults.standard.double(forKey: lastSuccessfulUpdateCheckAtKey)
         
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
            let savedDict = try? JSONDecoder().decode([String: AppSettings].self, from: data) {
@@ -432,6 +463,32 @@ class AppConfig: ObservableObject {
 
     func setDockAvoidanceMode(_ mode: DockAvoidanceMode) {
         dockAvoidanceModeRawValue = mode.rawValue
+    }
+
+    var updateCheckFrequency: UpdateCheckFrequency {
+        UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue) ?? .weekly
+    }
+
+    func setUpdateCheckFrequency(_ frequency: UpdateCheckFrequency) {
+        updateCheckFrequencyRawValue = frequency.rawValue
+    }
+
+    func shouldRunAutomaticUpdateCheck(now: Date = Date()) -> Bool {
+        switch updateCheckFrequency {
+        case .never:
+            return false
+        case .everyLaunch:
+            return true
+        case .weekly:
+            guard lastSuccessfulUpdateCheckAt > 0 else { return true }
+            let elapsed = now.timeIntervalSince1970 - lastSuccessfulUpdateCheckAt
+            return elapsed >= 7 * 24 * 60 * 60
+        }
+    }
+
+    func markSuccessfulUpdateCheck(at date: Date = Date()) {
+        lastSuccessfulUpdateCheckAt = date.timeIntervalSince1970
+        UserDefaults.standard.set(lastSuccessfulUpdateCheckAt, forKey: lastSuccessfulUpdateCheckAtKey)
     }
 
     func resolvedDockAvoidanceSide() -> String? {

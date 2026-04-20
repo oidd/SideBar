@@ -35,6 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 异常恢复逻辑：营救因上次崩溃、权限丢失或强制重启遗留在边缘的窗口
         rescueHiddenWindows(reason: "launch")
         startAXManagerIfNeeded()
+        scheduleAutomaticUpdateCheckIfNeeded()
     }
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -194,6 +195,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         axRuntimePausedByPermissionLoss = false
         axManager = AXWindowManager()
+    }
+
+    private func scheduleAutomaticUpdateCheckIfNeeded() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            UpdateChecker.shared.checkForUpdatesIfNeededOnLaunch()
+        }
     }
 
     private func suspendAXManagerForPermissionLoss() {

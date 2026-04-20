@@ -44,6 +44,7 @@ private enum ExplicitRevealTrigger {
 
 private struct ExplicitRevealIntent {
     let trigger: ExplicitRevealTrigger
+    let createdAt: Date
     let expiresAt: Date
 }
 
@@ -450,11 +451,32 @@ class WindowSession {
              return
         }
 
+        if isAnimating {
+            switch state {
+            case .snapped, .expanded:
+                updatePinControlWindow()
+                return
+            case .floating:
+                break
+            }
+        }
+
         let isOnScreen = isWindowOnScreen()
         
         switch state {
-        case .snapped, .expanded:
+        case .snapped:
             if isOnScreen {
+                let wasHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
+                if wasHidden, Date() >= indicatorAnimationSuppressionUntil {
+                    indicatorWindow.animateExpandFromDot()
+                }
+                showIndicator(animated: wasHidden && Date() >= indicatorAnimationSuppressionUntil)
+            } else {
+                indicatorWindow.orderOut(nil)
+                updatePinControlWindow()
+            }
+        case .expanded:
+            if shouldTreatExpandedWindowAsVisibleForIndicator(isOnScreen: isOnScreen) {
                 let wasHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
                 if wasHidden, Date() >= indicatorAnimationSuppressionUntil {
                     indicatorWindow.animateExpandFromDot()
@@ -469,6 +491,24 @@ class WindowSession {
             updatePinControlWindow()
         }
     }    
+
+    private func shouldTreatExpandedWindowAsVisibleForIndicator(isOnScreen: Bool) -> Bool {
+        if isOnScreen { return true }
+        guard case .expanded = state else { return false }
+
+        let now = Date()
+        if let targeted = Self.targetedActivationByPID[pid],
+           targeted.sessionID == ObjectIdentifier(self),
+           targeted.expiresAt > now {
+            return true
+        }
+
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              let frame = getWindowFrame() else {
+            return false
+        }
+        return getDisplayBounds().intersects(frame)
+    }
 
     private func scheduleIndicatorVisibilityRefresh(after delay: TimeInterval = 0.0) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -759,41 +799,79 @@ class WindowSession {
             return .content
         }
 
-        let dockThickness = estimatedDockThickness(for: frame, side: dockSide)
-        switch dockSide {
-        case "left":
-            if point.x <= frame.minX + dockThickness {
-                return .dock
-            }
-        case "right":
-            if point.x >= frame.maxX - dockThickness {
-                return .dock
-            }
-        case "bottom":
-            if point.y <= frame.minY + dockThickness {
-                return .dock
-            }
-        default:
-            break
+        if let dockRect = estimatedDockHitRect(for: frame, side: dockSide),
+           dockRect.contains(point) {
+            return .dock
         }
 
         return .content
     }
 
-    private static func estimatedDockThickness(for screenFrame: CGRect, side: String) -> CGFloat {
+    private static func dockPreferenceValue(forKey key: String) -> Any? {
         let dockDefaults = UserDefaults(suiteName: "com.apple.dock")
         let persistentDomain = UserDefaults.standard.persistentDomain(forName: "com.apple.dock")
+        return dockDefaults?.object(forKey: key) ?? persistentDomain?[key]
+    }
 
-        let tileSizeValue = dockDefaults?.object(forKey: "tilesize") as? NSNumber
-            ?? persistentDomain?["tilesize"] as? NSNumber
-        let largeSizeValue = dockDefaults?.object(forKey: "largesize") as? NSNumber
-            ?? persistentDomain?["largesize"] as? NSNumber
-        let magnificationEnabled = (dockDefaults?.object(forKey: "magnification") as? NSNumber)?.boolValue
-            ?? (persistentDomain?["magnification"] as? NSNumber)?.boolValue
-            ?? false
-        let autohideEnabled = (dockDefaults?.object(forKey: "autohide") as? NSNumber)?.boolValue
-            ?? (persistentDomain?["autohide"] as? NSNumber)?.boolValue
-            ?? false
+    private static func estimatedDockHitRect(for screenFrame: CGRect, side: String) -> CGRect? {
+        let thickness = estimatedDockThickness(for: screenFrame, side: side)
+
+        let tileSizeValue = dockPreferenceValue(forKey: "tilesize") as? NSNumber
+        let largeSizeValue = dockPreferenceValue(forKey: "largesize") as? NSNumber
+        let magnificationEnabled = (dockPreferenceValue(forKey: "magnification") as? NSNumber)?.boolValue ?? false
+        let showRecents = (dockPreferenceValue(forKey: "show-recents") as? NSNumber)?.boolValue ?? false
+
+        let persistentApps = dockPreferenceValue(forKey: "persistent-apps") as? [Any] ?? []
+        let persistentOthers = dockPreferenceValue(forKey: "persistent-others") as? [Any] ?? []
+        let runningRegularApps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.count
+
+        let tileSize = CGFloat(tileSizeValue?.doubleValue ?? 48)
+        let largeSize = CGFloat(largeSizeValue?.doubleValue ?? tileSize)
+        let iconSpan = magnificationEnabled ? max(tileSize, largeSize) : tileSize
+        let effectiveTileSpan = max(iconSpan + (magnificationEnabled ? 20 : 14), 56)
+
+        let appTileCount = max(persistentApps.count, runningRegularApps)
+        let totalTileCount = max(appTileCount + persistentOthers.count + (showRecents ? 3 : 0), 4)
+        let separatorGap: CGFloat = persistentOthers.isEmpty ? 0 : 24
+        let outerPadding: CGFloat = 40
+
+        let dockLength = CGFloat(totalTileCount) * effectiveTileSpan + separatorGap + outerPadding * 2
+
+        switch side {
+        case "left":
+            let clampedHeight = min(max(dockLength, 180), screenFrame.height - 24)
+            return CGRect(
+                x: screenFrame.minX,
+                y: screenFrame.midY - clampedHeight / 2,
+                width: thickness,
+                height: clampedHeight
+            )
+        case "right":
+            let clampedHeight = min(max(dockLength, 180), screenFrame.height - 24)
+            return CGRect(
+                x: screenFrame.maxX - thickness,
+                y: screenFrame.midY - clampedHeight / 2,
+                width: thickness,
+                height: clampedHeight
+            )
+        case "bottom":
+            let clampedWidth = min(max(dockLength, 220), screenFrame.width - 24)
+            return CGRect(
+                x: screenFrame.midX - clampedWidth / 2,
+                y: screenFrame.minY,
+                width: clampedWidth,
+                height: thickness
+            )
+        default:
+            return nil
+        }
+    }
+
+    private static func estimatedDockThickness(for screenFrame: CGRect, side: String) -> CGFloat {
+        let tileSizeValue = dockPreferenceValue(forKey: "tilesize") as? NSNumber
+        let largeSizeValue = dockPreferenceValue(forKey: "largesize") as? NSNumber
+        let magnificationEnabled = (dockPreferenceValue(forKey: "magnification") as? NSNumber)?.boolValue ?? false
+        let autohideEnabled = (dockPreferenceValue(forKey: "autohide") as? NSNumber)?.boolValue ?? false
 
         let tileSize = CGFloat(tileSizeValue?.doubleValue ?? 48)
         let largeSize = CGFloat(largeSizeValue?.doubleValue ?? tileSize)
@@ -898,6 +976,13 @@ class WindowSession {
                             Self.activateNonManagedApp(sourcePID: self.pid)
                         }
                     }
+                    if discardExplicitRevealIntentIfSiblingWindowWon() {
+                        print("📱 显式唤回被同 App 的其他标准窗口接管，丢弃本窗口展开意图")
+                        return
+                    }
+                    if Self.peekExplicitRevealIntent(for: pid) != nil {
+                        scheduleDeferredExplicitRevealIfNeeded()
+                    }
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
                     return
                 }
@@ -906,15 +991,18 @@ class WindowSession {
                     releaseFocusAfterSuppressedSpaceSwitchIfNeeded()
                     return
                 }
-                guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else {
+                guard let pendingRevealIntent = Self.peekExplicitRevealIntent(for: pid) else {
                     print("📱 应用被动回前台，忽略自动展开")
                     return
                 }
-                // 防抖：如果刚折叠不到 0.5 秒，忽略此次激活通知（阻止竞态导致折叠后立刻展开）
-                if Date().timeIntervalSince(lastCollapseTime) < 0.5 {
-                    print("📱 防抖: 忽略折叠后的立即展开请求")
+
+                if isRevealIntentStaleAfterLatestCollapse(pendingRevealIntent) {
+                    Self.clearExplicitRevealIntent(for: pid)
+                    print("📱 防抖: 忽略折叠前残留的旧展开意图")
                     return
                 }
+
+                guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else { return }
                 let interaction = interactionFlags(for: revealIntent.trigger)
                 let triggerLabel = revealIntent.trigger == .dockClick ? "Dock" : "App Switch"
                 print("📱 \(triggerLabel) 展开: \(bundleID)")
@@ -1332,6 +1420,7 @@ class WindowSession {
         cleanupExplicitRevealIntents()
         explicitRevealIntentByPID[pid] = ExplicitRevealIntent(
             trigger: trigger,
+            createdAt: Date(),
             expiresAt: Date().addingTimeInterval(explicitRevealIntentWindow)
         )
     }
@@ -1345,6 +1434,10 @@ class WindowSession {
         guard let intent = peekExplicitRevealIntent(for: pid) else { return nil }
         explicitRevealIntentByPID.removeValue(forKey: pid)
         return intent
+    }
+
+    private static func clearExplicitRevealIntent(for pid: pid_t) {
+        explicitRevealIntentByPID.removeValue(forKey: pid)
     }
 
     private func recentExplicitRevealTrigger() -> ExplicitRevealTrigger? {
@@ -1375,6 +1468,10 @@ class WindowSession {
         }
     }
 
+    private func isRevealIntentStaleAfterLatestCollapse(_ intent: ExplicitRevealIntent) -> Bool {
+        intent.createdAt <= lastCollapseTime
+    }
+
     private func shouldReleaseFinderDesktopActivation() -> Bool {
         guard bundleID == "com.apple.finder" else { return false }
         guard case .snapped = state else { return false }
@@ -1394,19 +1491,36 @@ class WindowSession {
     }
 
     func handleFocusedWindowChangedWithinApp() {
-        guard bundleID == "com.apple.finder" else { return }
         guard case .snapped = state else { return }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
         guard isCurrentFocusedWindowOfApp() else { return }
         guard Date().timeIntervalSince(lastCollapseTime) >= 0.2 else { return }
         guard !Self.shouldIgnoreProgrammaticActivation(for: pid) else { return }
-        registerExplicitRevealIntentIfNeeded()
-        guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else {
-            print("📱 Finder 焦点回到隐藏窗口，但缺少显式唤回意图，忽略自动展开")
+
+        if bundleID == "com.apple.finder" {
+            registerExplicitRevealIntentIfNeeded()
+        }
+
+        guard let pendingRevealIntent = Self.peekExplicitRevealIntent(for: pid) else {
+            if bundleID == "com.apple.finder" {
+                print("📱 Finder 焦点回到隐藏窗口，但缺少显式唤回意图，忽略自动展开")
+            }
             return
         }
 
-        print("📱 Finder 焦点窗口已回到被隐藏窗口，按窗口焦点变化触发展开")
+        if isRevealIntentStaleAfterLatestCollapse(pendingRevealIntent) {
+            Self.clearExplicitRevealIntent(for: pid)
+            print("📱 忽略: 折叠前残留的旧唤回意图")
+            return
+        }
+
+        guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else { return }
+
+        if bundleID == "com.apple.finder" {
+            print("📱 Finder 焦点窗口已回到被隐藏窗口，按窗口焦点变化触发展开")
+        } else {
+            print("📱 焦点窗口已回到被隐藏窗口，继续完成显式唤回")
+        }
         let interaction = interactionFlags(for: revealIntent.trigger)
         hasReleasedDockClick = interaction.hasReleasedDockClick
         expandWindow(isDockActivated: interaction.isDockActivated)
@@ -1417,6 +1531,58 @@ class WindowSession {
         let now = Date()
         guard now.timeIntervalSince(lastSpaceChangeAt) < 0.9 else { return false }
         return Self.lastGlobalMouseDownAt <= lastSpaceChangeAt
+    }
+
+    private func hasFocusedStandardSiblingWindowOfApp() -> Bool {
+        guard let subrole = focusedWindowSubroleOfApp(),
+              subrole == kAXStandardWindowSubrole else {
+            return false
+        }
+        return hasFocusedSiblingWindowOfApp()
+    }
+
+    private func discardExplicitRevealIntentIfSiblingWindowWon() -> Bool {
+        guard hasFocusedStandardSiblingWindowOfApp() else { return false }
+        guard Self.peekExplicitRevealIntent(for: pid) != nil else { return false }
+        Self.clearExplicitRevealIntent(for: pid)
+        return true
+    }
+
+    private func scheduleDeferredExplicitRevealIfNeeded() {
+        guard let pendingIntent = Self.peekExplicitRevealIntent(for: pid) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self else { return }
+            guard case .snapped = self.state else { return }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == self.pid else { return }
+            guard !Self.shouldIgnoreProgrammaticActivation(for: self.pid) else { return }
+
+            guard let intent = Self.peekExplicitRevealIntent(for: self.pid),
+                  intent.trigger == pendingIntent.trigger else { return }
+
+            if self.isRevealIntentStaleAfterLatestCollapse(intent) {
+                Self.clearExplicitRevealIntent(for: self.pid)
+                print("📱 忽略: 折叠前残留的延迟唤回意图")
+                return
+            }
+
+            if self.discardExplicitRevealIntentIfSiblingWindowWon() {
+                print("📱 显式唤回被同 App 的其他标准窗口接管，丢弃旧展开意图")
+                return
+            }
+
+            let frontmostOwnsFocus = self.isCurrentFocusedWindowOfApp()
+            let hasBlockingSibling = self.hasFocusedSiblingWindowOfApp()
+            guard frontmostOwnsFocus || !hasBlockingSibling else {
+                Self.clearExplicitRevealIntent(for: self.pid)
+                return
+            }
+
+            guard let consumedIntent = Self.consumeExplicitRevealIntent(for: self.pid) else { return }
+            let interaction = self.interactionFlags(for: consumedIntent.trigger)
+            self.hasReleasedDockClick = interaction.hasReleasedDockClick
+            self.expandWindow(isDockActivated: interaction.isDockActivated)
+        }
     }
 
     private func releaseFocusAfterSuppressedSpaceSwitchIfNeeded() {
@@ -2407,6 +2573,7 @@ class WindowSession {
             _ = refreshMirrorOverlaySnapshot(presentImmediately: false)
         }
         if case .expanded = state {
+            showIndicator(animated: false)
             updatePinControlWindow()
         }
     }
@@ -2669,6 +2836,7 @@ class WindowSession {
         endY: CGFloat? = nil,
         duration: TimeInterval,
         easeIn: Bool,
+        enableSlowPositionCompensation: Bool = false,
         onStart: (() -> Void)? = nil,
         completion: @escaping () -> Void
     ) {
@@ -2690,6 +2858,7 @@ class WindowSession {
             easeIn: easeIn,
             lockedWidth: lockedWidth,
             lockedHeight: currentFrame.height,
+            enableSlowPositionCompensation: enableSlowPositionCompensation,
             onStart: onStart,
             completion: completion
         )
@@ -2747,7 +2916,7 @@ class WindowSession {
                 triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
             }
             indicatorWindow.alphaValue = 1.0
-            showIndicator(animated: false)
+            showIndicator(animated: Date() >= indicatorAnimationSuppressionUntil)
             updatePinControlWindow()
             return
         }
@@ -2770,12 +2939,9 @@ class WindowSession {
                 self.isAnimating = false
                 if shouldTriggerEffects {
                     self.triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
-                    if !self.indicatorWindow.isVisible || self.indicatorWindow.alphaValue < 0.1 {
-                        self.indicatorWindow.animateExpandFromDot()
-                    }
                 }
                 self.indicatorWindow.alphaValue = 1.0
-                self.showIndicator(animated: false)
+                self.showIndicator(animated: Date() >= self.indicatorAnimationSuppressionUntil)
                 self.updatePinControlWindow()
             }
         }
@@ -2883,6 +3049,7 @@ class WindowSession {
                     endY: geometry.expanded.y,
                     duration: self.standardTransitionDuration(),
                     easeIn: false,
+                    enableSlowPositionCompensation: true,
                     onStart: {
                         // 动画开始的第一帧瞬间恢复可见，不再有“冲出再回弹”
                         self.setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
@@ -2894,6 +3061,11 @@ class WindowSession {
                             self.setWindowPosition(position: geometry.expanded)
                             let size = CGSize(width: self.lockedWidth, height: currentFrame.height)
                             axSetSizeAttribute(on: self.windowElement, size: size, context: "WindowSession.expandWindow.hover.safeLandingSize")
+                            if let runningApp = NSRunningApplication(processIdentifier: self.pid) {
+                                _ = runningApp.activate()
+                            }
+                            axSetBoolAttribute(on: self.windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.expandWindow.hover.safeLandingMain")
+                            axSetBoolAttribute(on: self.windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.expandWindow.hover.safeLandingFocused")
                         }
                         self.isAnimating = false
                         self.updatePinControlWindow()
@@ -3190,15 +3362,19 @@ class WindowAnimator {
     private var completion: (() -> Void)?
     private var onStart: (() -> Void)?
     private var hasCalledOnStart: Bool = false
+    private var lastAppliedProgress: CGFloat = 0
+    private var enableSlowPositionCompensation: Bool = false
     
     // 跨进程频率熔断：记录上次更新指令发送的时间，防止溢出 3rd 方 App 的缓冲区
     private var lastAXUpdateTime: CFAbsoluteTime = 0
     private let minAXInterval: TimeInterval = 0.016 // 锁定 60Hz 采样率，消除 120Hz 屏幕下的指令积压
+    private let slowPositionWriteThresholdMS: Double = 24
+    private let maxHoverTimeCompensationMS: Double = 36
     
     private var lockedWidth: CGFloat = 0
     private var lockedHeight: CGFloat = 0
     
-    func animate(element: AXUIElement, startX: CGFloat, endX: CGFloat, startY: CGFloat, endY: CGFloat, duration: TimeInterval, easeIn: Bool, lockedWidth: CGFloat, lockedHeight: CGFloat, onStart: (() -> Void)? = nil, completion: @escaping () -> Void) {
+    func animate(element: AXUIElement, startX: CGFloat, endX: CGFloat, startY: CGFloat, endY: CGFloat, duration: TimeInterval, easeIn: Bool, lockedWidth: CGFloat, lockedHeight: CGFloat, enableSlowPositionCompensation: Bool = false, onStart: (() -> Void)? = nil, completion: @escaping () -> Void) {
         stop()
         self.element = element
         self.startX = startX
@@ -3213,6 +3389,8 @@ class WindowAnimator {
         self.completion = completion
         self.hasCalledOnStart = false
         self.startTime = CFAbsoluteTimeGetCurrent()
+        self.lastAppliedProgress = 0
+        self.enableSlowPositionCompensation = enableSlowPositionCompensation
         
         var dl: CVDisplayLink?
         let result = CVDisplayLinkCreateWithActiveCGDisplays(&dl)
@@ -3243,6 +3421,9 @@ class WindowAnimator {
         let elapsed = currentTime - startTime
         var progress = CGFloat(elapsed / duration)
         var finished = false
+        if progress < lastAppliedProgress {
+            progress = lastAppliedProgress
+        }
         if progress >= 1.0 {
             progress = 1.0
             finished = true
@@ -3258,8 +3439,8 @@ class WindowAnimator {
         
         let currentX = startX + (endX - startX) * eased
         let currentY = startY + (endY - startY) * eased
-        var newPos = CGPoint(x: currentX, y: currentY)
-        var newSize = CGSize(width: lockedWidth, height: lockedHeight)
+        let newPos = CGPoint(x: currentX, y: currentY)
+        let newSize = CGSize(width: lockedWidth, height: lockedHeight)
         
         // 频率熔断核心：如果距离上次发指令不足 16ms，且不是最后一帧，则跳过此次 IPC 通讯
         let timeSinceLastAX = currentTime - lastAXUpdateTime
@@ -3270,11 +3451,28 @@ class WindowAnimator {
         
         if let el = element {
             // 优化：仅在必要时刻更新坐标
-            axSetPositionAttribute(on: el, position: newPos, context: "WindowAnimator.tick.position")
+            let positionStart = CFAbsoluteTimeGetCurrent()
+            let positionResult = axSetPositionAttribute(on: el, position: newPos, context: "WindowAnimator.tick.position")
+            let positionWriteMS = (CFAbsoluteTimeGetCurrent() - positionStart) * 1000
+
+            if enableSlowPositionCompensation {
+                let shouldCompensateForSlowWrite =
+                    positionResult == .cannotComplete ||
+                    positionWriteMS > slowPositionWriteThresholdMS
+
+                if shouldCompensateForSlowWrite {
+                    let excessMS = max(positionWriteMS - slowPositionWriteThresholdMS, 0)
+                    let compensationMS = min(
+                        maxHoverTimeCompensationMS,
+                        positionResult == .cannotComplete ? maxHoverTimeCompensationMS : excessMS * 0.6
+                    )
+                    startTime += compensationMS / 1000
+                }
+            }
             
             // IPC 优化：大幅减低指令频率。不再每帧设置 Size，仅在动画开始、结束以及中途两个关键点锁定。
             // 减流方案：如果是最后一帧(finished)或者第一帧(0.0)则必设；中间过程通过大幅间隔检测减流。
-            let isKeyFrame = finished || (progress == 0.0) || floor(progress * 2) != floor((progress - 0.02) * 2) 
+            let isKeyFrame = finished || (progress == 0.0) || floor(progress * 2) != floor((progress - 0.02) * 2)
             if isKeyFrame {
                 axSetSizeAttribute(on: el, size: newSize, context: "WindowAnimator.tick.size")
             }
@@ -3285,6 +3483,8 @@ class WindowAnimator {
                     DispatchQueue.main.async { cls() }
                 }
             }
+
+            lastAppliedProgress = max(lastAppliedProgress, progress)
         }
         
         return finished

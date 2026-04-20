@@ -605,6 +605,80 @@ struct LanguageMenuField: View {
     }
 }
 
+struct UpdateCheckFrequencyMenuField: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Binding var selection: Int
+    @State private var isPresented = false
+
+    var body: some View {
+        Button {
+            isPresented.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                Text(updateCheckFrequencyDisplay(selection))
+                    .font(.body)
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(width: 156, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(menuFieldFillColor(for: colorScheme))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(menuFieldStrokeColor(for: colorScheme), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .frame(width: 156, alignment: .trailing)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 4) {
+                updateFrequencyOption("从不检查".localized, tag: UpdateCheckFrequency.never.rawValue)
+                updateFrequencyOption("每次启动".localized, tag: UpdateCheckFrequency.everyLaunch.rawValue)
+                updateFrequencyOption("每周一次".localized, tag: UpdateCheckFrequency.weekly.rawValue)
+            }
+            .padding(8)
+            .frame(width: 160)
+        }
+    }
+
+    @ViewBuilder
+    private func updateFrequencyOption(_ title: String, tag: Int) -> some View {
+        Button {
+            selection = tag
+            isPresented = false
+        } label: {
+            HStack(spacing: 8) {
+                Text(title)
+                    .foregroundColor(.primary)
+                Spacer(minLength: 0)
+                if selection == tag {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(selection == tag ? Color.accentColor.opacity(0.10) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct DropdownOption {
     let title: String
     var image: NSImage? = nil
@@ -743,6 +817,17 @@ private func languageDisplay(_ value: Int) -> String {
         return "English".localized
     default:
         return "跟随系统".localized
+    }
+}
+
+private func updateCheckFrequencyDisplay(_ value: Int) -> String {
+    switch UpdateCheckFrequency(rawValue: value) ?? .weekly {
+    case .never:
+        return "从不检查".localized
+    case .everyLaunch:
+        return "每次启动".localized
+    case .weekly:
+        return "每周一次".localized
     }
 }
 
@@ -926,12 +1011,17 @@ private func makeSnapSideMenuImage(
 }
 
 struct GeneralSettingsView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var config: AppConfig
     
     // 定时刷新权限状态用
     @State private var axEnabled = AXIsProcessTrusted()
     @State private var screenCaptureEnabled = ScreenCaptureAccessManager.shared.hasAccess()
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    private var currentAppVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.4"
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -978,6 +1068,46 @@ struct GeneralSettingsView: View {
                                 Text("语言".localized)
                                 Spacer()
                                 LanguageMenuField(selection: $config.language)
+                            }
+
+                            HStack(alignment: .top, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("检查更新".localized)
+                                    Text("当前版本：".localized + currentAppVersion)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Spacer()
+
+                                Button(action: {
+                                    UpdateChecker.shared.checkForUpdates(manual: true)
+                                }) {
+                                    Text("立即检查".localized)
+                                        .font(.body)
+                                        .foregroundColor(.primary)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(menuFieldFillColor(for: colorScheme))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .stroke(menuFieldStrokeColor(for: colorScheme), lineWidth: 1)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+
+                                UpdateCheckFrequencyMenuField(
+                                    selection: Binding(
+                                        get: { config.updateCheckFrequencyRawValue },
+                                        set: { rawValue in
+                                            let frequency = UpdateCheckFrequency(rawValue: rawValue) ?? .weekly
+                                            config.setUpdateCheckFrequency(frequency)
+                                        }
+                                    )
+                                )
                             }
                         }
                         .padding(.leading, 8)
@@ -3046,7 +3176,16 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.3"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.4"
+
+    private var aboutHeaderIcon: NSImage? {
+        let resourceName = colorScheme == .dark ? "AboutAppIconDark" : "AboutAppIconLight"
+        if let iconURL = Bundle.main.url(forResource: resourceName, withExtension: "png"),
+           let icon = NSImage(contentsOf: iconURL) {
+            return icon
+        }
+        return NSImage(named: "AppIcon")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -3064,7 +3203,7 @@ struct AboutSettingsView: View {
     
     private var aboutAppHeader: some View {
         HStack(spacing: 16) {
-            if let appIcon = NSImage(named: "AppIcon") {
+            if let appIcon = aboutHeaderIcon {
                 Image(nsImage: appIcon)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -3117,18 +3256,6 @@ struct AboutSettingsView: View {
                         HStack(spacing: 4) {
                             Image(systemName: "globe")
                             Text("访问网站".localized)
-                        }
-                        .font(.system(size: 12, weight: .medium))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.accentColor)
-                    
-                    Button(action: {
-                        UpdateChecker.shared.checkForUpdates(manual: true)
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                            Text("检查更新".localized)
                         }
                         .font(.system(size: 12, weight: .medium))
                     }

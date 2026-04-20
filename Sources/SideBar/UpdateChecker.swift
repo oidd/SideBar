@@ -5,6 +5,11 @@ class UpdateChecker {
     static let shared = UpdateChecker()
     
     private let updateInfoURL = URL(string: "https://www.ivean.com/sidebar/updates/version.json")!
+
+    func checkForUpdatesIfNeededOnLaunch() {
+        guard AppConfig.shared.shouldRunAutomaticUpdateCheck() else { return }
+        checkForUpdates(manual: false)
+    }
     
     func checkForUpdates(manual: Bool = false) {
         var request = URLRequest(url: updateInfoURL)
@@ -29,11 +34,16 @@ class UpdateChecker {
                     if let finalURLString = downloadURLString, let downloadURL = URL(string: finalURLString) {
                         let releaseNotes = json["release_notes"] as? String ?? "包含重要的性能改进与功能更新。".localized
                         
-                        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.3"
+                        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.4"
+                        AppConfig.shared.markSuccessfulUpdateCheck()
                         
                         if self.isVersionGreaterThan(latestVersion, currentVersion) {
-                            DispatchQueue.main.async {
-                                self.showUpdateAlert(latestVersion: latestVersion, releaseNotes: releaseNotes, downloadURL: downloadURL)
+                            if manual {
+                                DispatchQueue.main.async {
+                                    self.showUpdateAlert(latestVersion: latestVersion, releaseNotes: releaseNotes, downloadURL: downloadURL)
+                                }
+                            } else {
+                                print("[SideBar] 自动检查发现新版本 \(latestVersion)，保持静默等待用户手动检查。")
                             }
                         } else {
                             if manual {

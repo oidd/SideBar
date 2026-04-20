@@ -29,11 +29,29 @@ class VisualEffectOverlayWindow: NSPanel {
         contentView.wantsLayer = true
         self.contentView = contentView
     }
+
+    private func resetExpandEffectLayers(closeWindow: Bool) {
+        cleanupWorkItem?.cancel()
+        cleanupWorkItem = nil
+
+        contentView?.layer?.removeAllAnimations()
+        beamLayer?.removeAllAnimations()
+        dustLayer?.removeAllAnimations()
+
+        beamLayer?.removeFromSuperlayer()
+        dustLayer?.removeFromSuperlayer()
+        beamLayer = nil
+        dustLayer = nil
+
+        if closeWindow {
+            orderOut(nil)
+        }
+    }
     
     // MARK: - Collapse Effect (Impact)
     
     func startCollapseEffect(edge: SnapEdge, point: CGPoint, color: NSColor, on screen: NSScreen? = nil) {
-        stopExpandEffect(closeWindow: true)
+        resetExpandEffectLayers(closeWindow: false)
         guard let layer = self.contentView?.layer, let targetScreen = screen ?? NSScreen.main else { return }
         
         let screenFrame = targetScreen.frame
@@ -94,11 +112,8 @@ class VisualEffectOverlayWindow: NSPanel {
     // MARK: - Expand Effect (Beam & Dust)
     
     func startExpandEffect(edge: SnapEdge, frame: NSRect, color: NSColor, on screen: NSScreen? = nil) {
-        cleanupWorkItem?.cancel()
-        cleanupWorkItem = nil
-        
         guard let layer = self.contentView?.layer, let targetScreen = screen ?? NSScreen.main else { return }
-        stopExpandEffect(closeWindow: false)
+        resetExpandEffectLayers(closeWindow: false)
         
         let screenFrame = targetScreen.frame
         self.setFrame(screenFrame, display: true)
@@ -315,23 +330,19 @@ class VisualEffectOverlayWindow: NSPanel {
     }
     
     func stopExpandEffect(closeWindow: Bool = true, immediate: Bool = false) {
-        cleanupWorkItem?.cancel()
-        cleanupWorkItem = nil
-        
-        let beamToRemove = beamLayer
-        let dustToRemove = dustLayer
-        
-        self.beamLayer = nil
-        self.dustLayer = nil
-
         if immediate {
-            beamToRemove?.removeFromSuperlayer()
-            dustToRemove?.removeFromSuperlayer()
-            if closeWindow {
-                self.orderOut(nil)
-            }
+            resetExpandEffectLayers(closeWindow: closeWindow)
             return
         }
+
+        cleanupWorkItem?.cancel()
+        cleanupWorkItem = nil
+
+        let beamToRemove = beamLayer
+        let dustToRemove = dustLayer
+
+        self.beamLayer = nil
+        self.dustLayer = nil
         
         if let beam = beamToRemove {
             let beamFade = CABasicAnimation(keyPath: "opacity")
