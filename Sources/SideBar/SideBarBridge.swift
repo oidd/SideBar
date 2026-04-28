@@ -44,6 +44,11 @@ private struct DockMinimizeHotkeyBindingsPayload: Codable {
 final class SideBarBridge: NSObject, ObservableObject {
     static let shared = SideBarBridge()
 
+    enum OwnershipTransferReason: String {
+        case detachedFromEdge = "detached_from_edge"
+        case snappedWhileFloatingSiblingsPresent = "snapped_with_floating_siblings"
+    }
+
     struct RuntimeClaimSnapshot: Equatable {
         let bundleID: String
         let hotkeyOwner: SideBarHotkeyClaim.HotkeyOwner
@@ -69,6 +74,7 @@ final class SideBarBridge: NSObject, ObservableObject {
         static let requestSideBarHotkeyAction = NSNotification.Name("com.ivean.DockMinimize.requestSideBarHotkeyAction")
         static let sideBarHotkeyActionAck = NSNotification.Name("com.ivean.SideBar.sideBarHotkeyActionAck")
         static let dockMinimizeHotkeyBindingsChanged = NSNotification.Name("com.ivean.DockMinimize.hotkeyBindingsDidChange")
+        static let bundleControlOwnershipChanged = NSNotification.Name("com.ivean.SideBar.bundleControlOwnershipChanged")
     }
 
     private enum FileNames {
@@ -154,8 +160,16 @@ final class SideBarBridge: NSObject, ObservableObject {
         }
     }
 
-    func syncRuntimeClaims(from snapshots: [RuntimeClaimSnapshot]) {
-        let aggregatedClaims = aggregateRuntimeClaims(from: snapshots)
+    func syncRuntimeClaims(
+        from snapshots: [RuntimeClaimSnapshot],
+        effectiveOwners: [String: SideBarHotkeyClaim.HotkeyOwner] = [:],
+        preferredSessionIDs: [String: String] = [:]
+    ) {
+        let aggregatedClaims = aggregateRuntimeClaims(
+            from: snapshots,
+            effectiveOwners: effectiveOwners,
+            preferredSessionIDs: preferredSessionIDs
+        )
         if aggregatedClaims != runtimeClaims {
             let changedBundles = Set(aggregatedClaims.keys).union(runtimeClaims.keys).sorted().compactMap { bundleID -> String? in
                 let oldClaim = runtimeClaims[bundleID]
@@ -187,6 +201,32 @@ final class SideBarBridge: NSObject, ObservableObject {
 
     func isMirroredHotkey(modifiers: UInt, keyCode: UInt16) -> Bool {
         mirroredHotkeyConflict(modifiers: modifiers, keyCode: keyCode, excluding: nil) != nil
+    }
+
+    func runtimeClaim(for bundleID: String) -> SideBarHotkeyClaim? {
+        runtimeClaims[bundleID]
+    }
+
+    func announceBundleControlTransfer(
+        bundleID: String,
+        appName: String,
+        owner: SideBarHotkeyClaim.HotkeyOwner,
+        reason: OwnershipTransferReason
+    ) {
+        let userInfo: [String: Any] = [
+            "bundleID": bundleID,
+            "appName": appName,
+            "owner": owner.rawValue,
+            "reason": reason.rawValue,
+            "sentAt": Self.iso8601String(from: Date())
+        ]
+
+        distributedCenter.postNotificationName(
+            NotificationNames.bundleControlOwnershipChanged,
+            object: nil,
+            userInfo: userInfo,
+            deliverImmediately: true
+        )
     }
 
     @objc private func handleHotkeyActionRequest(_ notification: Notification) {
@@ -231,33 +271,35 @@ final class SideBarBridge: NSObject, ObservableObject {
         }
     }
 
-    private func aggregateRuntimeClaims(from snapshots: [RuntimeClaimSnapshot]) -> [String: SideBarHotkeyClaim] {
-        var chosenSnapshots: [String: RuntimeClaimSnapshot] = [:]
-
-        for snapshot in snapshots where !snapshot.bundleID.isEmpty {
-            let normalized = RuntimeClaimSnapshot(
-                bundleID: snapshot.bundleID,
-                hotkeyOwner: snapshot.hotkeyOwner,
-                state: snapshot.state,
-                sessionID: snapshot.sessionID
-            )
-
-            if let current = chosenSnapshots[normalized.bundleID],
-               claimPriority(for: current) >= claimPriority(for: normalized) {
-                continue
-            }
-            chosenSnapshots[normalized.bundleID] = normalized
-        }
+    private func aggregateRuntimeClaims(
+        from snapshots: [RuntimeClaimSnapshot],
+        effectiveOwners: [String: SideBarHotkeyClaim.HotkeyOwner],
+        preferredSessionIDs: [String: String]
+    ) -> [String: SideBarHotkeyClaim] {
+        let groupedSnapshots = Dictionary(
+            grouping: snapshots.filter { !$0.bundleID.isEmpty },
+            by: \.bundleID
+        )
 
         var result: [String: SideBarHotkeyClaim] = [:]
-        for (bundleID, snapshot) in chosenSnapshots {
+        for bundleID in groupedSnapshots.keys.sorted() {
+            guard let bundleSnapshots = groupedSnapshots[bundleID], !bundleSnapshots.isEmpty else { continue }
+            let effectiveOwner = effectiveOwners[bundleID] ?? inferredOwner(from: bundleSnapshots)
+            guard let snapshot = selectRepresentativeSnapshot(
+                from: bundleSnapshots,
+                effectiveOwner: effectiveOwner,
+                preferredSessionID: preferredSessionIDs[bundleID]
+            ) else {
+                continue
+            }
+
             let previous = runtimeClaims[bundleID]
-            let isSameClaim = previous?.hotkeyOwner == snapshot.hotkeyOwner &&
+            let isSameClaim = previous?.hotkeyOwner == effectiveOwner &&
                 previous?.state == snapshot.state &&
                 previous?.sessionID == snapshot.sessionID
 
             result[bundleID] = SideBarHotkeyClaim(
-                hotkeyOwner: snapshot.hotkeyOwner,
+                hotkeyOwner: effectiveOwner,
                 state: snapshot.state,
                 sessionID: snapshot.sessionID,
                 lastChangedAt: isSameClaim ? previous?.lastChangedAt : Self.iso8601String(from: Date())
@@ -265,6 +307,46 @@ final class SideBarBridge: NSObject, ObservableObject {
         }
 
         return Dictionary(uniqueKeysWithValues: result.sorted { $0.key < $1.key })
+    }
+
+    private func inferredOwner(from snapshots: [RuntimeClaimSnapshot]) -> SideBarHotkeyClaim.HotkeyOwner {
+        guard let chosenSnapshot = snapshots.max(by: { claimPriority(for: $0) < claimPriority(for: $1) }) else {
+            return .dockminimize
+        }
+        return chosenSnapshot.hotkeyOwner
+    }
+
+    private func selectRepresentativeSnapshot(
+        from snapshots: [RuntimeClaimSnapshot],
+        effectiveOwner: SideBarHotkeyClaim.HotkeyOwner,
+        preferredSessionID: String?
+    ) -> RuntimeClaimSnapshot? {
+        snapshots.max { lhs, rhs in
+            representativePriority(
+                for: lhs,
+                effectiveOwner: effectiveOwner,
+                preferredSessionID: preferredSessionID
+            ) < representativePriority(
+                for: rhs,
+                effectiveOwner: effectiveOwner,
+                preferredSessionID: preferredSessionID
+            )
+        }
+    }
+
+    private func representativePriority(
+        for snapshot: RuntimeClaimSnapshot,
+        effectiveOwner: SideBarHotkeyClaim.HotkeyOwner,
+        preferredSessionID: String?
+    ) -> Int {
+        var score = claimPriority(for: snapshot)
+        if snapshot.hotkeyOwner == effectiveOwner {
+            score += 100
+        }
+        if let preferredSessionID, snapshot.sessionID == preferredSessionID {
+            score += 200
+        }
+        return score
     }
 
     private func claimPriority(for snapshot: RuntimeClaimSnapshot) -> Int {

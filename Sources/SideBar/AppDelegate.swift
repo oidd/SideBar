@@ -34,6 +34,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 异常恢复逻辑：营救因上次崩溃、权限丢失或强制重启遗留在边缘的窗口
         rescueHiddenWindows(reason: "launch")
+        MultiWindowTipController.shared.start()
         startAXManagerIfNeeded()
         SideBarBridge.shared.start()
         AppConfig.shared.refreshDockMinimizeBridgeExports()

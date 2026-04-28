@@ -6,6 +6,10 @@ class AXWindowManager {
     private let fusionCoordinator = FusionStripCoordinator()
     private var temporaryShortcutSession: WindowSession?
     private var temporarilyExcludedWindowKeys: Set<String> = []
+    private var bundleControlOwnerOverrides: [String: SideBarHotkeyClaim.HotkeyOwner] = [:]
+    private var bundlePreferredClaimSessionIDs: [String: String] = [:]
+    private var bundleLastExpandedSessions: [String: ObjectIdentifier] = [:]
+    private var bundleLastSnappedSessions: [String: ObjectIdentifier] = [:]
     private var hasCleanedUp = false
     
     // 监听应用级别的通知 (如焦点窗口变化)，跟踪新建的窗口
@@ -152,6 +156,7 @@ class AXWindowManager {
         // 检查用户是否在面板里勾选了它
         if AppConfig.shared.isAppEnabled(bundleID: bundleID) {
             monitorApp(pid: app.processIdentifier, bundleID: bundleID, maxRetries: 5)
+            prepareDockActivationRoutingIfNeeded(bundleID: bundleID)
         }
     }
     
@@ -163,6 +168,10 @@ class AXWindowManager {
             session.restoreAndDestroy()
         }
         sessions.removeAll()
+        bundleControlOwnerOverrides.removeAll()
+        bundlePreferredClaimSessionIDs.removeAll()
+        bundleLastExpandedSessions.removeAll()
+        bundleLastSnappedSessions.removeAll()
         fusionCoordinator.tearDownAll()
         fusionRefreshTimer?.invalidate()
         fusionRefreshTimer = nil
@@ -211,6 +220,10 @@ class AXWindowManager {
             session.suspendForAccessibilityLoss()
         }
         sessions.removeAll()
+        bundleControlOwnerOverrides.removeAll()
+        bundlePreferredClaimSessionIDs.removeAll()
+        bundleLastExpandedSessions.removeAll()
+        bundleLastSnappedSessions.removeAll()
         fusionCoordinator.tearDownAll()
         fusionRefreshTimer?.invalidate()
         fusionRefreshTimer = nil
@@ -433,8 +446,8 @@ class AXWindowManager {
                   let savedKeyCode = settings.shortcutKeyCode else { continue }
             
             if keyCode == savedKeyCode && modifiers == savedModifiers {
-                // 找到匹配的快捷键，查找对应 Session
-                if let session = sessions.first(where: { $0.bundleID == bundleID }) {
+                maybeShowMultiWindowTip(for: bundleID)
+                if let session = preferredControlSession(for: bundleID) {
                     session.toggleExpandCollapse()
                     return true
                 }
@@ -512,6 +525,12 @@ class AXWindowManager {
         session.onHotkeyRuntimeStateChanged = { [weak self] _ in
             self?.handleSessionRuntimeStateChanged()
         }
+        session.onStateTransition = { [weak self] session, oldState, newState in
+            self?.handleSessionStateTransition(session, oldState: oldState, newState: newState)
+        }
+        session.onManagedEdgeDetachment = { [weak self] session in
+            self?.handleManagedEdgeDetachment(for: session)
+        }
         session.onTemporaryShortcutSessionEnded = { [weak self] session, excludeWindow, removeSession in
             self?.handleTemporaryShortcutSessionEnded(session, excludeWindow: excludeWindow, removeSession: removeSession)
         }
@@ -558,12 +577,143 @@ class AXWindowManager {
         return "\(pid):\(windowID)"
     }
 
+    private func handleSessionStateTransition(_ session: WindowSession, oldState: SnapState, newState: SnapState) {
+        rememberBundleWindowHistory(for: session, newState: newState)
+        guard case .floating = oldState else { return }
+        guard case .snapped = newState else { return }
+        handleFloatingToSnappedTransition(for: session)
+    }
+
+    private func handleManagedEdgeDetachment(for session: WindowSession) {
+        let bundleSessions = sessions(for: session.bundleID)
+        guard bundleSessions.count > 1 else { return }
+
+        let previousOwner = effectiveBundleOwner(for: session.bundleID)
+        bundleControlOwnerOverrides[session.bundleID] = .dockminimize
+        bundlePreferredClaimSessionIDs[session.bundleID] = session.coordinationSessionID
+
+        let managedSiblingSessions = bundleSessions.filter {
+            $0 !== session && $0.isManagedForCoordination
+        }
+
+        let shouldShowNotice = previousOwner != .dockminimize || !managedSiblingSessions.isEmpty
+        if shouldShowNotice {
+            SideBarBridge.shared.announceBundleControlTransfer(
+                bundleID: session.bundleID,
+                appName: session.coordinationAppDisplayName,
+                owner: .dockminimize,
+                reason: .detachedFromEdge
+            )
+        }
+
+        fusionCoordinator.discardCachedDescriptors(for: [session] + managedSiblingSessions)
+
+        if !managedSiblingSessions.isEmpty {
+            managedSiblingSessions.forEach { $0.relinquishManagedStateForBundleTransfer() }
+        }
+
+        handleSessionRuntimeStateChanged()
+    }
+
+    private func handleFloatingToSnappedTransition(for session: WindowSession) {
+        let bundleSessions = sessions(for: session.bundleID)
+        guard bundleSessions.count > 1 else { return }
+        guard bundleSessions.contains(where: { $0 !== session && $0.isFloatingForCoordination }) else {
+            return
+        }
+
+        let previousOwner = effectiveBundleOwner(for: session.bundleID)
+        bundleControlOwnerOverrides[session.bundleID] = .sidebar
+        bundlePreferredClaimSessionIDs[session.bundleID] = session.coordinationSessionID
+
+        if previousOwner != .sidebar {
+            SideBarBridge.shared.announceBundleControlTransfer(
+                bundleID: session.bundleID,
+                appName: session.coordinationAppDisplayName,
+                owner: .sidebar,
+                reason: .snappedWhileFloatingSiblingsPresent
+            )
+        }
+
+        handleSessionRuntimeStateChanged()
+    }
+
+    private func sessions(for bundleID: String) -> [WindowSession] {
+        sessions.filter { $0.bundleID == bundleID }
+    }
+
+    private func effectiveBundleOwner(for bundleID: String) -> SideBarHotkeyClaim.HotkeyOwner {
+        let bundleSessions = sessions(for: bundleID)
+        guard !bundleSessions.isEmpty else { return .dockminimize }
+
+        let hasManaged = bundleSessions.contains { $0.isManagedForCoordination }
+        let hasFloating = bundleSessions.contains { $0.isFloatingForCoordination }
+
+        if hasManaged && hasFloating, let override = bundleControlOwnerOverrides[bundleID] {
+            return override
+        }
+        return hasManaged ? .sidebar : .dockminimize
+    }
+
+    private func reconcileBundleOwnershipState() {
+        let groupedSessions = Dictionary(grouping: sessions, by: \.bundleID)
+
+        bundleControlOwnerOverrides = bundleControlOwnerOverrides.filter { bundleID, _ in
+            guard let bundleSessions = groupedSessions[bundleID], !bundleSessions.isEmpty else {
+                return false
+            }
+            let hasManaged = bundleSessions.contains { $0.isManagedForCoordination }
+            let hasFloating = bundleSessions.contains { $0.isFloatingForCoordination }
+            return hasManaged && hasFloating
+        }
+
+        bundlePreferredClaimSessionIDs = bundlePreferredClaimSessionIDs.filter { bundleID, sessionID in
+            groupedSessions[bundleID]?.contains(where: { $0.coordinationSessionID == sessionID }) == true
+        }
+
+        bundleLastExpandedSessions = bundleLastExpandedSessions.filter { bundleID, sessionID in
+            groupedSessions[bundleID]?.contains(where: { ObjectIdentifier($0) == sessionID }) == true
+        }
+        bundleLastSnappedSessions = bundleLastSnappedSessions.filter { bundleID, sessionID in
+            groupedSessions[bundleID]?.contains(where: { ObjectIdentifier($0) == sessionID }) == true
+        }
+    }
+
     private func refreshSideBarHotkeyRuntime() {
-        SideBarBridge.shared.syncRuntimeClaims(from: sessions.map(\.runtimeClaimSnapshot))
+        reconcileBundleOwnershipState()
+
+        let effectiveOwners = Dictionary(
+            uniqueKeysWithValues: Set(sessions.map(\.bundleID)).sorted().map { bundleID in
+                (bundleID, effectiveBundleOwner(for: bundleID))
+            }
+        )
+
+        SideBarBridge.shared.syncRuntimeClaims(
+            from: sessions.map(\.runtimeClaimSnapshot),
+            effectiveOwners: effectiveOwners,
+            preferredSessionIDs: bundlePreferredClaimSessionIDs
+        )
     }
 
     private func handleForwardedHotkeyAction(bundleID: String) -> SideBarBridge.HotkeyActionResponse {
-        if let session = sessions.first(where: { $0.bundleID == bundleID }) {
+        let effectiveOwner = effectiveBundleOwner(for: bundleID)
+        let preferredSessionID = SideBarBridge.shared.runtimeClaim(for: bundleID)?.sessionID
+        maybeShowMultiWindowTip(for: bundleID)
+        let candidateSessions = sessions(for: bundleID).sorted { lhs, rhs in
+            forwardedHotkeyPriority(
+                for: lhs,
+                effectiveOwner: effectiveOwner,
+                preferredSessionID: preferredSessionID,
+                bundleID: bundleID
+            ) > forwardedHotkeyPriority(
+                for: rhs,
+                effectiveOwner: effectiveOwner,
+                preferredSessionID: preferredSessionID,
+                bundleID: bundleID
+            )
+        }
+
+        if let session = candidateSessions.first {
             if session.relinquishToDockMinimizeIfDetachedFromEdge() {
                 return SideBarBridge.HotkeyActionResponse(
                     handled: false,
@@ -596,5 +746,118 @@ class AXWindowManager {
         }
 
         return .unhandled
+    }
+
+    private func forwardedHotkeyPriority(
+        for session: WindowSession,
+        effectiveOwner: SideBarHotkeyClaim.HotkeyOwner,
+        preferredSessionID: String?,
+        bundleID: String
+    ) -> Int {
+        var score = 0
+
+        if let preferredControlSession = preferredControlSession(for: bundleID),
+           preferredControlSession === session {
+            score += 2000
+        }
+
+        if let preferredSessionID, session.coordinationSessionID == preferredSessionID {
+            score += 1000
+        }
+
+        switch effectiveOwner {
+        case .sidebar:
+            if session.isSnappedForCoordination {
+                score += 500
+            } else if session.isExpandedForCoordination {
+                score += 400
+            }
+        case .dockminimize:
+            if session.isFloatingForCoordination {
+                score += 500
+            } else if session.isExpandedForCoordination {
+                score += 200
+            } else if session.isSnappedForCoordination {
+                score += 100
+            }
+        }
+
+        return score
+    }
+
+    private func prepareDockActivationRoutingIfNeeded(bundleID: String) {
+        guard WindowSession.hasRecentDockClickIntent() else { return }
+        maybeShowMultiWindowTip(for: bundleID)
+        guard hasMultipleSnappedWindows(for: bundleID) else { return }
+        guard let session = preferredControlSession(for: bundleID) else { return }
+        WindowSession.suppressProgrammaticActivation(for: session.pid, duration: 0.5)
+        _ = session.toggleExpandCollapse()
+    }
+
+    private func rememberBundleWindowHistory(for session: WindowSession, newState: SnapState) {
+        let sessionID = ObjectIdentifier(session)
+        switch newState {
+        case .expanded:
+            bundleLastExpandedSessions[session.bundleID] = sessionID
+        case .snapped:
+            bundleLastSnappedSessions[session.bundleID] = sessionID
+        case .floating:
+            break
+        }
+    }
+
+    private func preferredControlSession(for bundleID: String) -> WindowSession? {
+        let candidateSessions = sessions(for: bundleID).filter {
+            $0.isSnappedForCoordination || $0.isExpandedForCoordination
+        }
+        guard !candidateSessions.isEmpty else { return nil }
+
+        let lastExpandedSessionID = bundleLastExpandedSessions[bundleID]
+        let lastSnappedSessionID = bundleLastSnappedSessions[bundleID]
+
+        return candidateSessions.max { lhs, rhs in
+            controlPriority(
+                for: lhs,
+                lastExpandedSessionID: lastExpandedSessionID,
+                lastSnappedSessionID: lastSnappedSessionID
+            ) < controlPriority(
+                for: rhs,
+                lastExpandedSessionID: lastExpandedSessionID,
+                lastSnappedSessionID: lastSnappedSessionID
+            )
+        }
+    }
+
+    private func controlPriority(
+        for session: WindowSession,
+        lastExpandedSessionID: ObjectIdentifier?,
+        lastSnappedSessionID: ObjectIdentifier?
+    ) -> Int {
+        var score = 0
+        let sessionID = ObjectIdentifier(session)
+
+        if sessionID == lastExpandedSessionID {
+            score += 1000
+        }
+        if sessionID == lastSnappedSessionID {
+            score += 500
+        }
+        if session.isExpandedForCoordination {
+            score += 200
+        } else if session.isSnappedForCoordination {
+            score += 100
+        }
+
+        return score
+    }
+
+    private func hasMultipleSnappedWindows(for bundleID: String) -> Bool {
+        sessions(for: bundleID).filter(\.isSnappedForCoordination).count >= 2
+    }
+
+    private func maybeShowMultiWindowTip(for bundleID: String) {
+        guard hasMultipleSnappedWindows(for: bundleID) else { return }
+        guard let appName = sessions(for: bundleID).first?.coordinationAppDisplayName else { return }
+        MultiWindowTipController.shared.show(appName: appName)
     }
 }

@@ -4,6 +4,7 @@ import SwiftUI
 class EdgeIndicatorWindow: NSPanel {
     var onMouseEntered: (() -> Void)?
     var onMouseExited: (() -> Void)?
+    var onMouseClicked: (() -> Void)?
     var currentEdge: Int = 0 { // 1 = left, 2 = right
         didSet {
             (contentView as? SimpleColorView)?.currentEdge = currentEdge
@@ -56,7 +57,25 @@ class EdgeIndicatorWindow: NSPanel {
             onMouseExited?()
         }
     }
-    
+
+    override func mouseDown(with event: NSEvent) {
+        guard let lineView = contentView as? SimpleColorView else {
+            super.mouseDown(with: event)
+            return
+        }
+        let point = lineView.convert(event.locationInWindow, from: nil)
+        if lineView.isPointInVisibleStrip(point) {
+            // 同步更新 hover 状态，避免后续逻辑错乱
+            if !isMouseInsideVisibleStrip {
+                isMouseInsideVisibleStrip = true
+                onMouseEntered?()
+            }
+            onMouseClicked?()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
     private func checkHit(with event: NSEvent) {
         guard let lineView = contentView as? SimpleColorView else { return }
         

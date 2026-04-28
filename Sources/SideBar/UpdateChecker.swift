@@ -34,7 +34,7 @@ class UpdateChecker {
                     if let finalURLString = downloadURLString, let downloadURL = URL(string: finalURLString) {
                         let releaseNotes = json["release_notes"] as? String ?? "包含重要的性能改进与功能更新。".localized
                         
-                        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.5"
+                        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.6"
                         AppConfig.shared.markSuccessfulUpdateCheck()
                         
                         if self.isVersionGreaterThan(latestVersion, currentVersion) {

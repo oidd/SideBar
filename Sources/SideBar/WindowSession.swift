@@ -119,6 +119,7 @@ class WindowSession {
         didSet {
             guard oldValue != state else { return }
             onHotkeyRuntimeStateChanged?(self)
+            onStateTransition?(self, oldValue, state)
         }
     }
     private var currentEdge: Int = 0
@@ -281,6 +282,9 @@ class WindowSession {
     private var hoverDelayTimer: Timer?
     private var hoverInterruptTimer: Timer?
     private var hoverCooldownActive: Bool = false
+    /// 用户在快照条上点击折叠后的临时锁：阻止后续 hover 自动展开，
+    /// 鼠标完全离开快照条后会自动解除。再次点击时立即解除并展开。
+    private var clickCollapseLockActive: Bool = false
     private var pinnedRaiseTimer: Timer?
     private var pinnedRaiseRemainingPulses: Int = 0
     // 尺寸锁定：防止反馈循环导致窗口变宽
@@ -293,6 +297,15 @@ class WindowSession {
     private var lastSpaceChangeAt: Date = .distantPast
     private var outsideCollapseCandidateSince: Date?
     private var lastSiblingWindowInteractionAt: Date?
+    /// 取消置顶（普通置顶 / 镜像置顶）后，临时让 checkMouseForCollapse 绕过
+    /// "兄弟窗口宽限期"判定，只走纯几何 isOutside。原因：sibling grace 是
+    /// 为右键菜单/弹出层这类瞬时子窗口设计的（Phase 55/56），但取消置顶后
+    /// 紧接着归位的过程中，鼠标可能恰好停留在某个同 PID 的非主窗口几何区域
+    /// 上，被持续打戳 lastSiblingWindowInteractionAt，导致 1.5s 宽限期循环
+    /// 续期，自动折叠永远不触发。短窗口绕过即可让鼠标在窗外的判定恢复正常，
+    /// 时间到了再回到原有 sibling 防误触逻辑，不影响其他功能。
+    private var siblingGraceBypassUntil: Date = .distantPast
+
     private var isTemporaryShortcutManaged = false
     private var isTemporarilyPinned = false
     private var isMirrorPinActive = false
@@ -323,7 +336,24 @@ class WindowSession {
     var onTemporaryShortcutSessionEnded: ((WindowSession, Bool, Bool) -> Void)?
     var onTemporaryShortcutStashStateChanged: ((WindowSession, Bool) -> Void)?
     var onHotkeyRuntimeStateChanged: ((WindowSession) -> Void)?
+    var onStateTransition: ((WindowSession, SnapState, SnapState) -> Void)?
+    var onManagedEdgeDetachment: ((WindowSession) -> Void)?
     var isManagedByTemporaryShortcut: Bool { isTemporaryShortcutManaged }
+    var coordinationAppDisplayName: String { appDisplayName }
+    var coordinationSessionID: String? { bridgeSessionID }
+    var isFloatingForCoordination: Bool {
+        if case .floating = state { return true }
+        return false
+    }
+    var isSnappedForCoordination: Bool {
+        if case .snapped = state { return true }
+        return false
+    }
+    var isExpandedForCoordination: Bool {
+        if case .expanded = state { return true }
+        return false
+    }
+    var isManagedForCoordination: Bool { !isFloatingForCoordination }
     
     init(appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String) {
         self.appElement = appElement
@@ -349,6 +379,9 @@ class WindowSession {
         }
         indicatorWindow.onMouseExited = { [weak self] in
             self?.handleMouseExitedIndicator()
+        }
+        indicatorWindow.onMouseClicked = { [weak self] in
+            self?.handleIndicatorClicked()
         }
         pinControlWindow.onToggle = { [weak self] in
             self?.toggleTemporaryPin()
@@ -416,10 +449,22 @@ class WindowSession {
     @discardableResult
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool {
         guard !isAnimating else { return false }
+        // 关键修复：临时置顶 / 镜像置顶期间，用户允许把窗口拖到屏幕任意位置；
+        // 不能在置顶期间把这种位移当成"detach"，否则 state 会被错误降级为 .floating，
+        // 取消置顶后即使窗口归位回边缘，自动折叠链路也已断开（`checkMouseForCollapse`
+        // 的 `guard case .expanded = state` 会直接早退）。
+        guard !isTemporarilyPinned else { return false }
         guard case .expanded = state else { return false }
         guard let frame = getRawWindowFrame(), isDetachedFromManagedEdge(frame) else { return false }
         transitionToFloatingFromManagedState()
         return true
+    }
+
+    func relinquishManagedStateForBundleTransfer() {
+        transitionToFloatingFromManagedState(
+            notifyOwnerChange: false,
+            restoreVisiblePositionIfNeeded: true
+        )
     }
 
     private func finishTemporaryShortcutSession(excludeWindow: Bool, removeSession: Bool) {
@@ -517,6 +562,7 @@ class WindowSession {
     
     private func handleMouseEnteredIndicator() {
         if hoverCooldownActive { return } // 悬停冷却锁开启中，阻止触发
+        if clickCollapseLockActive { return } // 用户点击折叠后的临时锁，阻止再次自动展开
         if Date() < fusionReentrySuppressionUntil { return }
         
         hoverDelayTimer?.invalidate()
@@ -559,17 +605,71 @@ class WindowSession {
         hoverInterruptTimer?.invalidate()
         hoverInterruptTimer = nil
         hoverCooldownActive = false // 彻底离开区域后，冷却锁破除
+        // 鼠标完全离开快照条后，解除“点击折叠临时锁”，恢复 hover 自动展开能力
+        clickCollapseLockActive = false
+    }
+
+    /// 处理用户对独立快照条（非融合）的单击事件：
+    /// - 展开态：点击折叠 + 进入临时锁，鼠标停留期间不再 hover 自动展开。
+    /// - 折叠态 + 临时锁：再次点击立即展开（保留锁，等待下一次点击折叠）。
+    /// - 折叠态 + 无锁：忽略，避免和悬停防误触逻辑互相干扰。
+    private func handleIndicatorClicked() {
+        if isAnimating { return }
+        if fusionHoverLock { return } // 融合接管时单条快照条点击交给融合逻辑
+        if isTemporarilyPinned { return }
+
+        // 取消 hover 等待中的展开倒计时
+        hoverDelayTimer?.invalidate()
+        hoverDelayTimer = nil
+        hoverInterruptTimer?.invalidate()
+        hoverInterruptTimer = nil
+
+        switch state {
+        case .expanded:
+            if collapseWindow() {
+                clickCollapseLockActive = true
+                hoverCooldownActive = false
+                scheduleFocusRelease(after: 0.35)
+            }
+        case .snapped:
+            guard clickCollapseLockActive else { return }
+            // 注意：不要清掉 clickCollapseLockActive。
+            // 鼠标停留在快照条期间，hover 仍被这把锁屏蔽（不会自动再展开），
+            // 但下一次点击进入 .expanded 分支时会再次进入"折叠+加锁"路径，
+            // 从而实现连续点击：折叠↔展开↔折叠↔展开… 鼠标离开后再由
+            // handleMouseExitedIndicator 解锁，恢复正常 hover 自动展开。
+            hoverCooldownActive = false
+            // 关键：不要走 isDockActivated 路径。
+            // 否则 expandWindow 会设置 pendingDockInteraction，导致 checkMouseForCollapse
+            // 在鼠标仍在快照条上（被识别为窗口外）时立即折叠刚展开的窗口。
+            hasReleasedDockClick = true
+            if expandWindow() {
+                if let runningApp = NSRunningApplication(processIdentifier: pid) {
+                    runningApp.activate(options: .activateIgnoringOtherApps)
+                }
+                axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.handleIndicatorClicked.main")
+                axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.handleIndicatorClicked.focused")
+            }
+        case .floating:
+            break
+        }
     }
     
     deinit {
         destroy()
     }
+
     
     @objc private func handleSpaceChanged() {
         lastSpaceChangeAt = Date()
 
         // [Space Switch Fix] 回归手工强控模式，先执行点状消散动画
-        self.indicatorWindow.animateCollapseToDot { }
+        // 当用户关闭“动态特效”时，跳过收缩成点的弹性动画，直接隐藏指示条。
+        if AppConfig.shared.isVisualEffectEnabled {
+            self.indicatorWindow.animateCollapseToDot { }
+        } else {
+            self.indicatorWindow.orderOut(nil)
+        }
         
         // 延迟 0.7s 检测系统的物理稳定状态
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
@@ -610,10 +710,11 @@ class WindowSession {
         case .snapped:
             if isOnScreen {
                 let wasHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
-                if wasHidden, Date() >= indicatorAnimationSuppressionUntil {
+                let shouldAnimate = wasHidden && isIndicatorAnimationAllowed
+                if shouldAnimate {
                     indicatorWindow.animateExpandFromDot()
                 }
-                showIndicator(animated: wasHidden && Date() >= indicatorAnimationSuppressionUntil)
+                showIndicator(animated: shouldAnimate)
             } else {
                 indicatorWindow.orderOut(nil)
                 updatePinControlWindow()
@@ -621,10 +722,11 @@ class WindowSession {
         case .expanded:
             if shouldTreatExpandedWindowAsVisibleForIndicator(isOnScreen: isOnScreen) {
                 let wasHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
-                if wasHidden, Date() >= indicatorAnimationSuppressionUntil {
+                let shouldAnimate = wasHidden && isIndicatorAnimationAllowed
+                if shouldAnimate {
                     indicatorWindow.animateExpandFromDot()
                 }
-                showIndicator(animated: wasHidden && Date() >= indicatorAnimationSuppressionUntil)
+                showIndicator(animated: shouldAnimate)
             } else {
                 indicatorWindow.orderOut(nil)
                 updatePinControlWindow()
@@ -919,6 +1021,17 @@ class WindowSession {
         if modifiers.contains(.command), event.keyCode == 48 {
             lastAppSwitchIntentAt = now
         }
+    }
+
+    static func hasRecentDockClickIntent(now: Date = Date()) -> Bool {
+        guard let sample = lastGlobalMouseDownSample else { return false }
+        guard now.timeIntervalSince(sample.at) <= explicitRevealIntentWindow else { return false }
+        guard sample.region == .dock else { return false }
+        return sample.at >= lastGlobalKeyDownAt
+    }
+
+    static func suppressProgrammaticActivation(for pid: pid_t, duration: TimeInterval) {
+        registerProgrammaticActivationIgnore(for: pid, duration: duration)
     }
 
     private static func classifyGlobalClickRegion(at point: CGPoint) -> GlobalClickRegion {
@@ -1277,6 +1390,11 @@ class WindowSession {
             self.forceWindowGeometry(x: targetFrame.minX, y: targetFrame.minY, height: targetFrame.height)
             self.isAnimating = false
             self.pinnedAnchor = nil
+            // 关键修复：取消置顶并归位后，清空 sibling 防误触相关的所有状态，
+            // 并临时绕过 sibling grace 判定 2 秒。原因详见 siblingGraceBypassUntil 注释。
+            self.lastSiblingWindowInteractionAt = nil
+            self.outsideCollapseCandidateSince = nil
+            self.siblingGraceBypassUntil = Date().addingTimeInterval(2.0)
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
             self.updatePinControlWindow()
@@ -1338,6 +1456,11 @@ class WindowSession {
             self.forceWindowGeometry(x: targetFrame.minX, y: targetFrame.minY, height: targetFrame.height)
             self.isAnimating = false
             self.pinnedAnchor = nil
+            // 关键修复：取消镜像置顶并归位后，清空 sibling 防误触相关的所有状态，
+            // 并临时绕过 sibling grace 判定 2 秒。原因详见 siblingGraceBypassUntil 注释。
+            self.lastSiblingWindowInteractionAt = nil
+            self.outsideCollapseCandidateSince = nil
+            self.siblingGraceBypassUntil = Date().addingTimeInterval(2.0)
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
             self.updatePinControlWindow()
@@ -2084,6 +2207,12 @@ class WindowSession {
         indicatorAnimationSuppressionUntil = Date().addingTimeInterval(duration)
     }
 
+    /// 是否允许在快照条展开/折叠/重布局时播放指示条的拉伸回弹与点状收放动画。
+    /// 受 "动态特效" 总开关与 indicatorAnimationSuppressionUntil 时间窗双重约束。
+    private var isIndicatorAnimationAllowed: Bool {
+        return AppConfig.shared.isVisualEffectEnabled && Date() >= indicatorAnimationSuppressionUntil
+    }
+
     private func suppressFusionReentry(for duration: TimeInterval) {
         fusionReentrySuppressionUntil = Date().addingTimeInterval(duration)
     }
@@ -2384,12 +2513,20 @@ class WindowSession {
         }
     }
 
-    private func transitionToFloatingFromManagedState() {
+    private func transitionToFloatingFromManagedState(
+        notifyOwnerChange: Bool = true,
+        restoreVisiblePositionIfNeeded: Bool = false
+    ) {
         guard case .floating = state else {
+            let previousState = state
             invalidatePendingFocusRelease()
             queuedForwardedHotkeyToggle = false
             let shouldEndTemporaryShortcutSession = isTemporaryShortcutManaged
+            let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
             state = .floating
+            if notifyOwnerChange {
+                onManagedEdgeDetachment?(self)
+            }
             notifyTemporaryShortcutStashStateChanged(isStashed: false)
             unlockScreen()
             isIndicatorSuppressed = false
@@ -2405,6 +2542,21 @@ class WindowSession {
             hasReleasedDockClick = false
             fusionHoverLock = false
             windowAnimator.stop()
+            if restoreVisiblePositionIfNeeded {
+                setWindowAlpha(1.0, isHidden: false, frameHint: currentFrame, preserveRecoveryRecord: true)
+                if case .snapped = previousState {
+                    let positionResult = axSetPositionAttribute(
+                        on: windowElement,
+                        position: safeRestorePosition(for: currentFrame),
+                        context: "WindowSession.transitionToFloatingFromManagedState.position"
+                    )
+                    if positionResult == .success {
+                        clearTrackedWindowRecoveryState(frameHint: currentFrame)
+                    }
+                } else {
+                    clearTrackedWindowRecoveryState(frameHint: currentFrame)
+                }
+            }
             if shouldEndTemporaryShortcutSession {
                 let shouldKeepConfiguredSession = AppConfig.shared.isAppEnabled(bundleID: bundleID)
                 finishTemporaryShortcutSession(
@@ -3124,7 +3276,7 @@ class WindowSession {
                 triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
             }
             indicatorWindow.alphaValue = 1.0
-            showIndicator(animated: Date() >= indicatorAnimationSuppressionUntil)
+            showIndicator(animated: isIndicatorAnimationAllowed)
             updatePinControlWindow()
             runQueuedForwardedHotkeyToggleIfNeeded()
             return true
@@ -3150,7 +3302,7 @@ class WindowSession {
                     self.triggerCollapseEffect(edge: edge, point: impactPoint, color: customColor)
                 }
                 self.indicatorWindow.alphaValue = 1.0
-                self.showIndicator(animated: Date() >= self.indicatorAnimationSuppressionUntil)
+                self.showIndicator(animated: self.isIndicatorAnimationAllowed)
                 self.updatePinControlWindow()
                 self.runQueuedForwardedHotkeyToggleIfNeeded()
             }
@@ -3334,7 +3486,7 @@ class WindowSession {
         if let view = indicatorWindow.contentView as? SimpleColorView {
             view.updateLayout(stripLength: h, edge: currentEdge)
             
-            if animated && Date() >= indicatorAnimationSuppressionUntil {
+            if animated && isIndicatorAnimationAllowed {
                 view.playSquashAndStretch(targetLength: h)
             }
         }
@@ -3385,14 +3537,20 @@ class WindowSession {
             pinSafeRectContainsMouse = false
         }
         let isOutside = !bufferRect.contains(mappedMouseLoc) && !pinSafeRectContainsMouse
-        let isInsideSiblingWindow = isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
-        if isInsideSiblingWindow {
+        // 取消置顶后的短暂绕过：让自动折叠仅依赖纯几何 isOutside，
+        // 避免镜像置顶 / 普通置顶过程中残留的同 PID 兄弟窗口几何/焦点状态把鼠标判定卡死。
+        let bypassSiblingGrace = now < siblingGraceBypassUntil
+        let rawIsInsideSiblingWindow = isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
+        let isInsideSiblingWindow = bypassSiblingGrace ? false : rawIsInsideSiblingWindow
+        if rawIsInsideSiblingWindow && !bypassSiblingGrace {
             lastSiblingWindowInteractionAt = now
         }
-        let isSiblingWindowFocused =
-            hasFocusedSiblingWindowOfApp() &&
-            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-        let isWithinSiblingWindowGrace = isWithinSiblingWindowPostInteractionGrace(now)
+        let isSiblingWindowFocused = bypassSiblingGrace
+            ? false
+            : (hasFocusedSiblingWindowOfApp() &&
+               NSWorkspace.shared.frontmostApplication?.processIdentifier == pid)
+        let isWithinSiblingWindowGrace = bypassSiblingGrace ? false : isWithinSiblingWindowPostInteractionGrace(now)
+
 
         if pendingDockInteraction {
             if !isOutside {

@@ -55,6 +55,10 @@ private struct FusionOverlayModel {
     let hoveredSessionID: ObjectIdentifier?
     let showsIcons: Bool
     let allowsImmediateHoverSync: Bool
+    /// 整组所有段共享的"图标列中心 X"（panel 局部坐标），保证所有段图标与胶囊对齐到同一条竖线。
+    let iconColumnCenterX: CGFloat
+    /// 整组所有段共享的标签胶囊宽度，让所有胶囊同宽并以图标中心对称展开。
+    let labelCapsuleWidth: CGFloat
 }
 
 final class FusionStripCoordinator {
@@ -66,6 +70,9 @@ final class FusionStripCoordinator {
     private var switchVersions: [FusionGroupKey: Int] = [:]
     private var transitionHoldUntil: [FusionGroupKey: Date] = [:]
     private var hoverActivationArmed: [FusionGroupKey: Bool] = [:]
+    /// 段级“点击折叠临时锁”：记录每个 group 当前被点击折叠的 sessionID。
+    /// 鼠标停留在该段时，hover 不会再次自动展开；移动到其他段或离开融合条会立即解除。
+    private var clickCollapseLockedSessionIDs: [FusionGroupKey: ObjectIdentifier] = [:]
     private var sessionLookup: [ObjectIdentifier: WindowSession] = [:]
     private var lastValidDescriptors: [ObjectIdentifier: FusionStripSessionDescriptor] = [:]
     private var removalGraceUntilBySessionID: [ObjectIdentifier: Date] = [:]
@@ -206,6 +213,14 @@ final class FusionStripCoordinator {
         }
     }
 
+    func discardCachedDescriptors(for sessions: [WindowSession]) {
+        let sessionIDs = sessions.map(ObjectIdentifier.init)
+        sessionIDs.forEach {
+            lastValidDescriptors.removeValue(forKey: $0)
+            removalGraceUntilBySessionID.removeValue(forKey: $0)
+        }
+    }
+
     private func makeOverlay(for key: FusionGroupKey) -> FusionIndicatorWindow {
         let overlay = FusionIndicatorWindow()
         overlay.onTrackHoverChanged = { [weak self] isInside in
@@ -213,6 +228,9 @@ final class FusionStripCoordinator {
         }
         overlay.onHoveredSessionChange = { [weak self] sessionID in
             self?.handleHoveredSessionChange(sessionID, for: key)
+        }
+        overlay.onSegmentClicked = { [weak self] sessionID in
+            self?.handleSegmentClicked(sessionID, for: key)
         }
         return overlay
     }
@@ -241,6 +259,13 @@ final class FusionStripCoordinator {
         hoverTimers[key]?.invalidate()
         hoverTimers.removeValue(forKey: key)
 
+        // 段级临时锁解除策略：
+        // - 鼠标在融合条上但不指向任何段、或指向锁定段以外的其他段，立即解除锁定
+        if let lockedID = clickCollapseLockedSessionIDs[key],
+           sessionID != lockedID {
+            clickCollapseLockedSessionIDs.removeValue(forKey: key)
+        }
+
         guard hoverInsideTrack[key] == true, let sessionID = sessionID else {
             hoveredSessionIDs[key] = nil
             refreshOverlay(for: key)
@@ -254,6 +279,12 @@ final class FusionStripCoordinator {
         }
 
         hoveredSessionIDs[key] = sessionID
+
+        // 该段被点击折叠锁定时，不触发 hover 自动展开
+        if clickCollapseLockedSessionIDs[key] == sessionID {
+            refreshOverlay(for: key)
+            return
+        }
 
         let activeSessionID = models[key]?.activeSessionID
         if activeSessionID == sessionID {
@@ -278,6 +309,59 @@ final class FusionStripCoordinator {
         }
 
         refreshOverlay(for: key)
+    }
+
+    /// 处理融合条段单击事件：
+    /// - 点击的是当前 active 段（窗口已展开）→ fusionHide 折叠该段，并将其置入临时锁。
+    /// - 点击的是已被锁定的段 → 解除锁定，立即激活展开该段。
+    /// - 点击的是其它段：交给现有 hover→activate 逻辑处理（这里不做特殊处理，因为段切换已经会自动 reveal）。
+    private func handleSegmentClicked(_ sessionID: ObjectIdentifier, for key: FusionGroupKey) {
+        guard let model = models[key] else { return }
+        guard model.segments.contains(where: { $0.sessionID == sessionID }) else { return }
+
+        hoverTimers[key]?.invalidate()
+        hoverTimers.removeValue(forKey: key)
+        switchVersions[key, default: 0] += 1
+
+        // 已锁定的段被再次点击 → 解锁并展开
+        if clickCollapseLockedSessionIDs[key] == sessionID {
+            clickCollapseLockedSessionIDs.removeValue(forKey: key)
+            hoveredSessionIDs[key] = sessionID
+            hoverActivationArmed[key] = true
+            activateSession(sessionID, in: key)
+            refreshOverlay(for: key)
+            return
+        }
+
+        // 当前 active 段被点击 → 折叠并锁定
+        if model.activeSessionID == sessionID {
+            sessionLookup[sessionID]?.fusionHide()
+            clickCollapseLockedSessionIDs[key] = sessionID
+
+            let updatedModel = FusionOverlayModel(
+                panelFrame: model.panelFrame,
+                edge: model.edge,
+                trackRect: model.trackRect,
+                hitRect: model.hitRect,
+                segments: model.segments,
+                activeSessionID: nil,
+                hoveredSessionID: hoveredSessionIDs[key],
+                showsIcons: hoverInsideTrack[key] == true,
+                allowsImmediateHoverSync: hoverActivationArmed[key] == true,
+                iconColumnCenterX: model.iconColumnCenterX,
+                labelCapsuleWidth: model.labelCapsuleWidth
+            )
+            models[key] = updatedModel
+            overlays[key]?.update(with: updatedModel)
+            return
+        }
+
+
+        // 点击的是非 active 的其他段：直接走 activate 路径（按用户预期立即切换）
+        clickCollapseLockedSessionIDs.removeValue(forKey: key)
+        hoveredSessionIDs[key] = sessionID
+        hoverActivationArmed[key] = true
+        activateSession(sessionID, in: key)
     }
 
     private func activateSession(_ sessionID: ObjectIdentifier, in key: FusionGroupKey, expectedVersion: Int? = nil) {
@@ -312,11 +396,14 @@ final class FusionStripCoordinator {
             activeSessionID: sessionID,
             hoveredSessionID: hoveredSessionIDs[key],
             showsIcons: hoverInsideTrack[key] == true,
-            allowsImmediateHoverSync: hoverActivationArmed[key] == true
+            allowsImmediateHoverSync: hoverActivationArmed[key] == true,
+            iconColumnCenterX: model.iconColumnCenterX,
+            labelCapsuleWidth: model.labelCapsuleWidth
         )
 
         models[key] = model
         overlays[key]?.update(with: model)
+
 
         if let currentActiveID, currentActiveID != sessionID {
             sessionLookup[currentActiveID]?.fusionHide()
@@ -365,12 +452,15 @@ final class FusionStripCoordinator {
             activeSessionID: baseModel.activeSessionID,
             hoveredSessionID: hoveredSessionIDs[key],
             showsIcons: hoverInsideTrack[key] == true,
-            allowsImmediateHoverSync: hoverActivationArmed[key] == true
+            allowsImmediateHoverSync: hoverActivationArmed[key] == true,
+            iconColumnCenterX: baseModel.iconColumnCenterX,
+            labelCapsuleWidth: baseModel.labelCapsuleWidth
         )
 
         models[key] = refreshedModel
         overlays[key]?.update(with: refreshedModel)
     }
+
 
     private func normalizeExpandedSessions(
         in members: [FusionStripSessionDescriptor],
@@ -472,13 +562,38 @@ final class FusionStripCoordinator {
         let unionMaxY = members.map(\.visibleMaxY).max() ?? screenFrame.maxY
         let unionHeight = max(1, unionMaxY - unionMinY)
         let maxWindowHeight = members.map(\.windowHeight).max() ?? unionHeight
-        let panelWidth: CGFloat = 232
+
+        // === 方案 A：所有段共享对齐参数 ===
+        // 1) 计算本组最大胶囊宽度（与 drawIconRow 内一致的算法），用于动态拉宽 panel 并统一胶囊宽度
+        let labelHorizontalPadding: CGFloat = 9
+        let iconSize: CGFloat = 32
+        let sideMargin: CGFloat = 12
+        let screenInset: CGFloat = 10
+        let trackWidth: CGFloat = 6
+        let labelMinWidth: CGFloat = 60
+        let labelMaxWidth: CGFloat = 132
+        let edgePadding: CGFloat = 8
+
+        let measuringFont = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
+        let measuringAttributes: [NSAttributedString.Key: Any] = [.font: measuringFont]
+        let memberLabelWidths: [CGFloat] = members.map { descriptor in
+            let textWidth = ceil((descriptor.title as NSString).size(withAttributes: measuringAttributes).width)
+            let raw = textWidth + labelHorizontalPadding * 2
+            return min(max(raw, labelMinWidth), labelMaxWidth)
+        }
+        let groupLabelWidth = memberLabelWidths.max() ?? labelMinWidth
+        let iconColumnReserved = max(iconSize, groupLabelWidth)
+        let dynamicPanelWidth = ceil(
+            screenInset + trackWidth + sideMargin + iconColumnReserved + edgePadding
+        )
+        // 保留 232 作为下限，向上至 360 以容纳长标题；超过屏幕宽度则收敛到屏幕宽度
+        let panelWidth: CGFloat = min(max(dynamicPanelWidth, 232), min(360, screenFrame.width))
+
         let visualHeight = max(unionHeight, maxWindowHeight)
         let panelHeight = min(screenFrame.height, visualHeight + 96)
         let groupMidY = (unionMinY + unionMaxY) / 2
         let panelOriginY = clamp(groupMidY - panelHeight / 2, min: screenFrame.minY, max: screenFrame.maxY - panelHeight)
 
-        let screenInset: CGFloat = 10
         let panelOriginX: CGFloat
         if members[0].edge == 1 {
             panelOriginX = screenFrame.minX - screenInset
@@ -488,13 +603,21 @@ final class FusionStripCoordinator {
 
         let panelFrame = CGRect(x: panelOriginX, y: panelOriginY, width: panelWidth, height: panelHeight)
 
-        let trackWidth: CGFloat = 6
         let visibleTrackX: CGFloat
         if members[0].edge == 1 {
             visibleTrackX = screenInset
         } else {
             visibleTrackX = panelWidth - screenInset - trackWidth
         }
+
+        // 2) 计算"图标列中心 X"：所有段共用，保证图标与胶囊都对齐到同一条竖线
+        let iconColumnCenterX: CGFloat
+        if members[0].edge == 1 {
+            iconColumnCenterX = visibleTrackX + trackWidth + sideMargin + iconColumnReserved / 2
+        } else {
+            iconColumnCenterX = visibleTrackX - sideMargin - iconColumnReserved / 2
+        }
+
 
         let trackRect = CGRect(
             x: visibleTrackX,
@@ -554,11 +677,14 @@ final class FusionStripCoordinator {
             activeSessionID: activeSessionID,
             hoveredSessionID: hoveredSessionIDs[group.key],
             showsIcons: hoverInsideTrack[group.key] == true,
-            allowsImmediateHoverSync: hoverActivationArmed[group.key] == true
+            allowsImmediateHoverSync: hoverActivationArmed[group.key] == true,
+            iconColumnCenterX: iconColumnCenterX,
+            labelCapsuleWidth: groupLabelWidth
         )
     }
 
     private func presentFusionOverloadWarningOnce() {
+
         AppConfig.shared.markFusionOverloadWarningShown()
 
         DispatchQueue.main.async {
@@ -581,6 +707,7 @@ private func clamp(_ value: CGFloat, min lowerBound: CGFloat, max upperBound: CG
 final class FusionIndicatorWindow: NSPanel {
     var onTrackHoverChanged: ((Bool) -> Void)?
     var onHoveredSessionChange: ((ObjectIdentifier?) -> Void)?
+    var onSegmentClicked: ((ObjectIdentifier) -> Void)?
 
     private let fusionView = FusionIndicatorContentView()
     private let trackerWindow = FusionTrackerWindow()
@@ -606,6 +733,9 @@ final class FusionIndicatorWindow: NSPanel {
         trackerWindow.onHoveredSessionChange = { [weak self] sessionID in
             self?.onHoveredSessionChange?(sessionID)
         }
+        trackerWindow.onSegmentClicked = { [weak self] sessionID in
+            self?.onSegmentClicked?(sessionID)
+        }
         contentView = fusionView
     }
 
@@ -625,6 +755,7 @@ final class FusionIndicatorWindow: NSPanel {
 final class FusionTrackerWindow: NSPanel {
     var onTrackHoverChanged: ((Bool) -> Void)?
     var onHoveredSessionChange: ((ObjectIdentifier?) -> Void)?
+    var onSegmentClicked: ((ObjectIdentifier) -> Void)?
 
     private let trackerView = FusionTrackerContentView()
 
@@ -648,6 +779,9 @@ final class FusionTrackerWindow: NSPanel {
         }
         trackerView.onHoveredSessionChange = { [weak self] sessionID in
             self?.onHoveredSessionChange?(sessionID)
+        }
+        trackerView.onSegmentClicked = { [weak self] sessionID in
+            self?.onSegmentClicked?(sessionID)
         }
         contentView = trackerView
     }
@@ -742,10 +876,10 @@ private final class FusionIndicatorContentView: NSView {
     }
 
     private func drawIconRow(for segment: FusionOverlaySegment, hoveredSessionID: ObjectIdentifier?) {
+        guard let model = model else { return }
         let rowOpacity: CGFloat = hoveredSessionID == segment.sessionID ? 1.0 : 0.5
         let iconSize: CGFloat = 32
         let stackGap: CGFloat = 4
-        let sideMargin: CGFloat = 10
         let labelHorizontalPadding: CGFloat = 9
         let labelHeight: CGFloat = 20
         let labelFont = NSFont.systemFont(ofSize: 12.5, weight: hoveredSessionID == segment.sessionID ? .semibold : .medium)
@@ -760,19 +894,17 @@ private final class FusionIndicatorContentView: NSView {
             .foregroundColor: textColor,
             .paragraphStyle: style
         ]
-        let rawLabelWidth = ceil((segment.title as NSString).size(withAttributes: attributes).width) + labelHorizontalPadding * 2
-        let labelWidth = min(max(rawLabelWidth, 54), 104)
+
+        // === 方案 A：所有段共享同一个 stackCenterX，由 controller 端统一计算 ===
+        // 这样无论标题长短，所有段的图标和胶囊中心都对齐到同一条竖线，整列视觉对齐。
+        let stackCenterX: CGFloat = model.iconColumnCenterX
+
+        // 胶囊宽度：使用整组共享宽度，所有段宽度一致；同时确保不溢出 iconColumn 容器
+        let labelWidth: CGFloat = model.labelCapsuleWidth
 
         let centerY = segment.slotRect.midY
         let stackHeight = iconSize + stackGap + labelHeight
         let stackOriginY = centerY - stackHeight / 2
-        let stackCenterX: CGFloat
-
-        if model?.edge == 1 {
-            stackCenterX = segment.slotRect.maxX + sideMargin + max(iconSize, labelWidth) / 2
-        } else {
-            stackCenterX = segment.slotRect.minX - sideMargin - max(iconSize, labelWidth) / 2
-        }
 
         let labelRect = CGRect(
             x: stackCenterX - labelWidth / 2,
@@ -798,6 +930,7 @@ private final class FusionIndicatorContentView: NSView {
         let textRect = labelRect.insetBy(dx: labelHorizontalPadding, dy: 2)
         segment.title.draw(in: textRect, withAttributes: attributes)
     }
+
 
     private func dividerColor() -> NSColor {
         let darkMode = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -857,6 +990,7 @@ private final class FusionIndicatorContentView: NSView {
 private final class FusionTrackerContentView: NSView {
     var onTrackHoverChanged: ((Bool) -> Void)?
     var onHoveredSessionChange: ((ObjectIdentifier?) -> Void)?
+    var onSegmentClicked: ((ObjectIdentifier) -> Void)?
 
     var model: FusionOverlayModel?
 
@@ -896,6 +1030,31 @@ private final class FusionTrackerContentView: NSView {
             hoveredSessionID = nil
             onHoveredSessionChange?(nil)
         }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let model else {
+            super.mouseDown(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else {
+            super.mouseDown(with: event)
+            return
+        }
+        let translatedY = point.y + model.hitRect.minY
+        if let segment = model.segments.first(where: {
+            $0.slotRect.contains(CGPoint(x: model.trackRect.midX, y: translatedY))
+        }) {
+            // 同步刷新 hover 状态，确保后续 hover 解锁/激活路径有正确的 sessionID
+            if hoveredSessionID != segment.sessionID {
+                hoveredSessionID = segment.sessionID
+                onHoveredSessionChange?(segment.sessionID)
+            }
+            onSegmentClicked?(segment.sessionID)
+            return
+        }
+        super.mouseDown(with: event)
     }
 
     func syncHoverStateToCurrentMouse() {

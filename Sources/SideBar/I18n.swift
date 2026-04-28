@@ -47,7 +47,7 @@ class I18n {
         "右侧被程序坞占据，涉及右侧的快照条不会生效": "The right side is occupied by the Dock, so any right-side snapshot bar behavior will not take effect.",
         "垂直容差 (Y轴)": "Vertical Tolerance (Y-Axis)",
         "复制 (⌘C)": "Copy (⌘C)",
-        "关闭后，快照条仍会正常展开与折叠，只是不再播放粒子与射线动画。": "When disabled, the snapshot bar will still expand and collapse normally, but the particle and beam animations will no longer play.",
+        "关闭后，快照条仍会正常展开与折叠，只是不再播放粒子、射线和拉伸回弹动画。": "When disabled, the snapshot bar will still expand and collapse normally, but the particle, beam, and bounce animations will no longer play.",
         "动态特效": "Visual Effects",
         "外观与透明度": "Appearance & Opacity",
         "快照条样式": "Snapshot Bar Style",
@@ -84,7 +84,7 @@ class I18n {
         "当同一侧的多个快照条发生重叠时，自动融合为一根可分段切换的大快照条。": "When multiple snapshot bars overlap on the same edge, automatically merge them into one segmented fused snapshot bar.",
         "展开 / 折叠特效": "Expand / Collapse Effects",
         "容忍安全区实时推演": "Safe Zone Preview",
-        "控制快照条在展开与折叠时的粒子和射线效果。": "Control the particle and beam effects when the snapshot bar expands and collapses.",
+        "控制快照条在展开与折叠时的粒子、射线和拉伸回弹效果。": "Control the particle, beam, and bounce effects when the snapshot bar expands and collapses.",
         "将屏幕边缘的魔法收纳术带给所有的第三方应用。拖拽吸附，悬停弹射，纯粹且静谧。": "Bring the magic of screen-edge organization to all third-party apps. Drag to dock, hover to pop out, pure and silent.",
         "将屏幕边缘的魔法收纳术带给所有的第三方应用。": "Bring the magic of screen-edge organization to all third-party apps.",
         "临时折叠当前活跃窗口": "Temporarily Stash Active Window",
@@ -133,6 +133,7 @@ class I18n {
         "查找 (⌘F)": "Find (⌘F)",
         "检查更新": "Check for Updates",
         "检查更新失败": "Update Check Failed",
+        "检测到应用的多窗口环境": "Multiple Window Environment Detected",
         "橙色": "Orange",
         "软件": "App",
         "颜色": "Color",
@@ -163,6 +164,7 @@ class I18n {
         "统一规划或单独调节每个启用软件快照条的色彩及透明程度。": "Unify or individually adjust the color and opacity of each enabled app's snapshot bar.",
         "颜色与透明度": "Color & Opacity",
         "当前同侧融合快照条包含超过 5 个窗口，快速切换时可能出现卡顿。": "The fused snapshot bar on this edge currently contains more than 5 windows, so rapid switching may stutter.",
+        "“%@”存在多个窗口被折叠。通过点击程序坞中“%@”的图标或使用快捷键时，SideBar 默认会操作最后一次展开过的窗口。其他窗口可通过悬停快照条进行操作。": "\"%@\" has multiple collapsed windows. When you click \"%@\" in the Dock or use a shortcut, SideBar will operate the window that was expanded most recently by default. Other windows can be accessed by hovering over the snapshot bar.",
         "建议适当减少同侧堆叠的窗口数量，以获得更稳定的切换体验。": "Consider reducing the number of windows stacked on the same edge for smoother switching.",
         "从不检查": "Never",
         "立即检查": "Check Now",
@@ -208,13 +210,15 @@ class I18n {
         "重做 (⇧⌘Z)": "Redo (⇧⌘Z)",
         "重置为 60": "Reset to 60",
         "重置归零": "Reset to Zero",
+        "关闭提示（%d）": "Dismiss Tip (%d)",
         "防误触容差": "Window Tolerances",
         "防误触缓冲 (悬停延时)": "Hover Delay Buffer",
         "隐藏 (⌘H)": "Hide (⌘H)",
         "隐藏菜单栏图标后，您需要在访达(Finder)中再次运行SideBar来打开此设置面板。": "After hiding the menu bar icon, you need to run SideBar in Finder again to open this settings panel.",
         "需要辅助功能权限": "Accessibility Permission Required",
         "黄色": "Yellow",
-        "黑色": "Black"
+        "黑色": "Black",
+        "调色": "Custom Color"
     ]
     
     func translate(_ key: String, language: AppLanguage) -> String {

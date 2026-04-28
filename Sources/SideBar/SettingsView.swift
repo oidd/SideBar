@@ -1,6 +1,114 @@
 import SwiftUI
 import AppKit
 
+// MARK: - 调色盘协调器
+
+class ColorPickerCoordinator: NSObject {
+    static var activeInstance: ColorPickerCoordinator?
+    private var onChange: ((String) -> Void)?
+    
+    func showColorPanel(initialColor: NSColor, onChange: @escaping (String) -> Void) {
+        // Keep self alive
+        ColorPickerCoordinator.activeInstance = self
+        self.onChange = onChange
+        
+        let panel = NSColorPanel.shared
+        panel.isContinuous = true
+        panel.setTarget(self)
+        panel.setAction(#selector(colorPanelDidChange))
+        panel.color = initialColor
+        panel.makeKeyAndOrderFront(nil)
+    }
+    
+    @objc private func colorPanelDidChange(_ sender: NSColorPanel) {
+        guard let hex = sender.color.toHex() else { return }
+        onChange?("custom_\(hex)")
+    }
+}
+
+// MARK: - 彩虹渐变圆图标
+
+private func makeRainbowCircleImage(size: CGFloat = 14, colorScheme: ColorScheme) -> NSImage {
+    let nsSize = NSSize(width: size, height: size)
+    let image = NSImage(size: nsSize)
+    image.lockFocus()
+    let rect = NSRect(origin: .zero, size: nsSize)
+    
+    // 用圆形裁剪
+    let circlePath = NSBezierPath(ovalIn: rect)
+    circlePath.addClip()
+    
+    // 角度渐变（锥形渐变）：用多个扇形色块模拟 conic gradient
+    let center = NSPoint(x: rect.midX, y: rect.midY)
+    let radius = max(rect.width, rect.height)
+    
+    // 彩虹色环：红 → 橙 → 黄 → 绿 → 青 → 蓝 → 紫 → 红（首尾闭合）
+    let hueStops: [(CGFloat, NSColor)] = [
+        (0.0,   NSColor(red: 1, green: 0.149, blue: 0.149, alpha: 1)),  // 红
+        (0.08,  NSColor(red: 1, green: 0.40, blue: 0.0, alpha: 1)),     // 红橙
+        (0.16,  NSColor(red: 1, green: 0.60, blue: 0.0, alpha: 1)),     // 橙
+        (0.25,  NSColor(red: 1, green: 0.85, blue: 0.0, alpha: 1)),     // 橙黄
+        (0.33,  NSColor(red: 0.80, green: 0.95, blue: 0.0, alpha: 1)),  // 黄绿
+        (0.42,  NSColor(red: 0.18, green: 0.82, blue: 0.25, alpha: 1)), // 绿
+        (0.52,  NSColor(red: 0.0, green: 0.78, blue: 0.85, alpha: 1)),  // 青
+        (0.64,  NSColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1)),   // 蓝
+        (0.76,  NSColor(red: 0.40, green: 0.30, blue: 0.95, alpha: 1)), // 靛蓝
+        (0.88,  NSColor(red: 0.72, green: 0.20, blue: 0.80, alpha: 1)), // 紫
+        (1.0,   NSColor(red: 1, green: 0.149, blue: 0.149, alpha: 1))   // 红（闭合）
+    ]
+    
+    let segments = 72 // 扇形数量，越多越平滑
+    for i in 0..<segments {
+        let startAngle = CGFloat(i) / CGFloat(segments) * 360.0
+        let endAngle = CGFloat(i + 1) / CGFloat(segments) * 360.0
+        let t = CGFloat(i) / CGFloat(segments)
+        
+        // 在色标中插值
+        var color = hueStops.last!.1
+        for j in 1..<hueStops.count {
+            if t <= hueStops[j].0 {
+                let prevStop = hueStops[j - 1]
+                let nextStop = hueStops[j]
+                let localT = (t - prevStop.0) / (nextStop.0 - prevStop.0)
+                color = interpolateColor(prevStop.1, nextStop.1, t: localT)
+                break
+            }
+        }
+        
+        let wedge = NSBezierPath()
+        wedge.move(to: center)
+        wedge.appendArc(withCenter: center, radius: radius, startAngle: startAngle, endAngle: endAngle)
+        wedge.close()
+        color.setFill()
+        wedge.fill()
+    }
+    
+    // 边框
+    NSGraphicsContext.current?.saveGraphicsState()
+    let borderColor = colorScheme == .dark ? NSColor.white.withAlphaComponent(0.4) : NSColor.gray.withAlphaComponent(0.3)
+    borderColor.setStroke()
+    let borderPath = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+    borderPath.lineWidth = 0.75
+    borderPath.stroke()
+    NSGraphicsContext.current?.restoreGraphicsState()
+    
+    image.unlockFocus()
+    image.isTemplate = false
+    return image
+}
+
+/// 在两个 NSColor 之间线性插值
+private func interpolateColor(_ c1: NSColor, _ c2: NSColor, t: CGFloat) -> NSColor {
+    let r1 = c1.redComponent, g1 = c1.greenComponent, b1 = c1.blueComponent
+    let r2 = c2.redComponent, g2 = c2.greenComponent, b2 = c2.blueComponent
+    return NSColor(
+        red: r1 + (r2 - r1) * t,
+        green: g1 + (g2 - g1) * t,
+        blue: b1 + (b2 - b1) * t,
+        alpha: 1
+    )
+}
+
 enum SettingsTab: String, CaseIterable {
     case apps
     case appearance
@@ -184,8 +292,8 @@ struct SettingsSidebarItem: View {
             : .spring(response: 0.26, dampingFraction: 0.84, blendDuration: 0.14)
     }
 
-    private var activeBlue: Color {
-        Color(nsColor: .systemBlue)
+    private var activeOrange: Color {
+        Color(red: 252.0 / 255.0, green: 133.0 / 255.0, blue: 12.0 / 255.0)
     }
 
     private var hoverGray: Color {
@@ -213,14 +321,14 @@ struct SettingsSidebarItem: View {
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    activeBlue.opacity(colorScheme == .dark ? 0.20 : 0.15),
-                                    activeBlue.opacity(colorScheme == .dark ? 0.10 : 0.04)
+                                    activeOrange.opacity(colorScheme == .dark ? 0.22 : 0.14),
+                                    activeOrange.opacity(colorScheme == .dark ? 0.10 : 0.05)
                                 ],
                                 startPoint: .leading,
                                 endPoint: .trailing
                             )
                         )
-                        .shadow(color: activeBlue.opacity(0.12), radius: 8, x: 0, y: 0)
+                        .shadow(color: activeOrange.opacity(0.12), radius: 8, x: 0, y: 0)
                         .frame(width: isSelected ? beamWidth : 0, height: proxy.size.height)
                         .offset(x: beamLeadingInset)
                         .animation(selectedBeamAnimation, value: isSelected)
@@ -244,11 +352,11 @@ struct SettingsSidebarItem: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 Capsule(style: .continuous)
-                    .fill(isSelected ? activeBlue : hoverGray)
+                    .fill(isSelected ? activeOrange : hoverGray)
                     .frame(width: isSelected ? 4 : 3, height: isSelected ? 34 : 22)
                     .opacity(isSelected || isHovered ? 1 : 0)
                     .padding(.leading, 8)
-                    .shadow(color: isSelected ? activeBlue.opacity(0.18) : .clear, radius: 6, x: 0, y: 0)
+                    .shadow(color: isSelected ? activeOrange.opacity(0.18) : .clear, radius: 6, x: 0, y: 0)
                     .animation(selectedBeamAnimation, value: isSelected)
                     .animation(transitionAnimation, value: isHovered)
             }
@@ -277,7 +385,7 @@ struct SettingsTabIcon: View {
 
     private var tint: Color {
         if isSelected {
-            return Color(nsColor: .systemBlue)
+            return Color(red: 252.0 / 255.0, green: 133.0 / 255.0, blue: 12.0 / 255.0)
         }
         if isHovered {
             return .primary.opacity(0.85)
@@ -971,7 +1079,7 @@ private func makeSnapSideMenuImage(
     let baseStroke = colorScheme == .dark
         ? NSColor.white.withAlphaComponent(enabled ? 0.22 : 0.12)
         : NSColor.black.withAlphaComponent(enabled ? 0.20 : 0.10)
-    let activeStroke = NSColor.controlAccentColor.withAlphaComponent(enabled ? 0.95 : 0.28)
+    let activeStroke = NSColor(red: 252.0/255.0, green: 133.0/255.0, blue: 12.0/255.0, alpha: enabled ? 0.95 : 0.28)
 
     let outline = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
     outline.lineWidth = 1.25
@@ -1020,7 +1128,7 @@ struct GeneralSettingsView: View {
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.5"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.6"
     }
     
     var body: some View {
@@ -1936,10 +2044,31 @@ struct AppRowView: View {
                         }
                     }
                 }
+                
+                Button {
+                    let coordinator = ColorPickerCoordinator()
+                    let initialColor: NSColor
+                    if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+                        initialColor = customColor
+                    } else {
+                        initialColor = NSColor.white
+                    }
+                    coordinator.showColorPanel(initialColor: initialColor) { customColorName in
+                        onColorChange(customColorName)
+                    }
+                } label: {
+                    Label {
+                        Text("调色".localized)
+                    } icon: {
+                        Image(nsImage: makeRainbowCircleImage(size: 14, colorScheme: colorScheme))
+                    }
+                }
             } label: {
                 HStack(spacing: 6) {
                     if colorName == "auto" {
                         Image(nsImage: generateAutoColorSwatchImage(size: 14, opacity: opacity))
+                    } else if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+                        Image(nsImage: generateColorSwatchImage(size: 14, color: Color(customColor), opacity: opacity))
                     } else {
                         Image(nsImage: generateColorSwatchImage(size: 14, color: getSelectedColor(), opacity: opacity))
                     }
@@ -1974,10 +2103,16 @@ struct AppRowView: View {
     }
     
     private func getSelectedColor() -> Color {
+        if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+            return Color(customColor)
+        }
         return colorOptions.first { $0.0 == colorName }?.2 ?? .white
     }
     
     private func getSelectedColorDisplayName() -> String {
+        if colorName.hasPrefix("custom_") {
+            return "调色".localized
+        }
         return colorOptions.first { $0.0 == colorName }?.1 ?? "白色".localized
     }
 
@@ -2084,7 +2219,7 @@ struct AppearanceSettingsView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("展开 / 折叠特效".localized)
                                     .font(.headline)
-                                Text("控制快照条在展开与折叠时的粒子和射线效果。".localized)
+                                Text("控制快照条在展开与折叠时的粒子、射线和拉伸回弹效果。".localized)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -2390,17 +2525,21 @@ struct AppearanceColorMenuField: View {
         Menu {
             ForEach(options.indices, id: \.self) { index in
                 let option = options[index]
-                Button {
-                    option.action()
-                } label: {
-                    if let image = option.image {
-                        Label {
+                if option.title == "---" {
+                    Divider()
+                } else {
+                    Button {
+                        option.action()
+                    } label: {
+                        if let image = option.image {
+                            Label {
+                                Text(option.title)
+                            } icon: {
+                                Image(nsImage: image)
+                            }
+                        } else {
                             Text(option.title)
-                        } icon: {
-                            Image(nsImage: image)
                         }
-                    } else {
-                        Text(option.title)
                     }
                 }
             }
@@ -2408,6 +2547,8 @@ struct AppearanceColorMenuField: View {
             HStack(spacing: 6) {
                 if colorName == "auto" {
                     Image(nsImage: generateAutoColorSwatchImage(size: 14, opacity: opacity))
+                } else if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+                    Image(nsImage: generateColorSwatchImage(size: 14, color: Color(customColor), opacity: opacity))
                 } else {
                     Image(nsImage: generateColorSwatchImage(size: 14, color: getSelectedColor(), opacity: opacity))
                 }
@@ -2428,6 +2569,9 @@ struct AppearanceColorMenuField: View {
     }
     
     private func getSelectedColor() -> Color {
+        if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+            return Color(customColor)
+        }
         let colorOptions = [
             ("auto", "自动".localized, Color.gray),
             ("white", "白色".localized, Color.white),
@@ -2554,15 +2698,7 @@ struct AppAppearanceRowView: View {
                     colorName: colorName,
                     opacity: opacity,
                     title: getSelectedColorDisplayName(),
-                    options: colorOptions.map { option in
-                        DropdownOption(
-                            title: option.1,
-                            image: option.0 == "auto" ? generateAutoColorImage() : generateColorImage(color: option.2),
-                            isSelected: option.0 == colorName
-                        ) {
-                            onColorChange(option.0)
-                        }
-                    }
+                    options: buildColorOptions()
                 )
 
                 CompactMenuField(
@@ -2607,11 +2743,49 @@ struct AppAppearanceRowView: View {
         }
     }
     
+    private func buildColorOptions() -> [DropdownOption] {
+        var options = colorOptions.map { option in
+            DropdownOption(
+                title: option.1,
+                image: option.0 == "auto" ? generateAutoColorImage() : generateColorImage(color: option.2),
+                isSelected: option.0 == colorName
+            ) {
+                onColorChange(option.0)
+            }
+        }
+        
+        // 调色选项
+        options.append(DropdownOption(
+            title: "调色".localized,
+            image: makeRainbowCircleImage(size: 14, colorScheme: colorScheme),
+            isSelected: colorName.hasPrefix("custom_")
+        ) {
+            let coordinator = ColorPickerCoordinator()
+            let initialColor: NSColor
+            if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+                initialColor = customColor
+            } else {
+                initialColor = NSColor.white
+            }
+            coordinator.showColorPanel(initialColor: initialColor) { customColorName in
+                onColorChange(customColorName)
+            }
+        })
+        
+        return options
+    }
+    
     private func getSelectedColor() -> Color {
+        if colorName.hasPrefix("custom_"), let customColor = NSColor(hex: String(colorName.dropFirst(7))) {
+            return Color(customColor)
+        }
         return colorOptions.first { $0.0 == colorName }?.2 ?? .white
     }
     
     private func getSelectedColorDisplayName() -> String {
+        if colorName.hasPrefix("custom_") {
+            return "调色".localized
+        }
         return colorOptions.first { $0.0 == colorName }?.1 ?? "白色".localized
     }
 
@@ -3223,7 +3397,7 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.5"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.6"
 
     private var aboutHeaderIcon: NSImage? {
         let resourceName = colorScheme == .dark ? "AboutAppIconDark" : "AboutAppIconLight"
@@ -3236,13 +3410,29 @@ struct AboutSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 32) {
-                    aboutAppHeader
-                    aboutRecommendations
-                }
+            // 顶部固定区：应用图标与简介
+            aboutAppHeader
                 .padding(.horizontal, 32)
                 .padding(.top, 24)
+                .padding(.bottom, 20)
+
+            // 固定的“作者的奇思妙想”小标题
+            Text("作者的奇思妙想".localized)
+                .font(.footnote)
+                .bold()
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 32)
+                .padding(.bottom, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // 仅滚动推荐列表部分
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 12) {
+                    ForEach(recommendedToolsList) { tool in
+                        RecommendationRow(tool: tool)
+                    }
+                }
+                .padding(.horizontal, 32)
                 .padding(.bottom, 32)
             }
         }

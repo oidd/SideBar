@@ -95,6 +95,7 @@ class AppConfig: ObservableObject {
     private let fusionStripEnabledKey = "SideBarFusionStripEnabled"
     private let fusionOverloadWarningShownKey = "SideBarFusionOverloadWarningShown"
     private let mirrorPinEnabledKey = "SideBarMirrorPinEnabled"
+    private let suppressMultiWindowTipKey = "SideBarSuppressMultiWindowTip"
     private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
     private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
     private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
@@ -210,6 +211,12 @@ class AppConfig: ObservableObject {
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
     }
+
+    @Published var suppressMultiWindowTip: Bool = false {
+        didSet {
+            UserDefaults.standard.set(suppressMultiWindowTip, forKey: suppressMultiWindowTipKey)
+        }
+    }
     
     @Published var language: Int = 0 {
         didSet {
@@ -305,6 +312,13 @@ class AppConfig: ObservableObject {
             UserDefaults.standard.set(false, forKey: mirrorPinEnabledKey)
         } else {
             self.isMirrorPinEnabled = UserDefaults.standard.bool(forKey: mirrorPinEnabledKey)
+        }
+
+        if UserDefaults.standard.object(forKey: suppressMultiWindowTipKey) == nil {
+            self.suppressMultiWindowTip = false
+            UserDefaults.standard.set(false, forKey: suppressMultiWindowTipKey)
+        } else {
+            self.suppressMultiWindowTip = UserDefaults.standard.bool(forKey: suppressMultiWindowTipKey)
         }
         
         if UserDefaults.standard.object(forKey: "SideBarLanguage") == nil {
@@ -415,6 +429,9 @@ class AppConfig: ObservableObject {
         case "orange": return NSColor(red: 1, green: 0.8, blue: 0.502, alpha: 1)
         case "black": return NSColor.black
         case "white": return NSColor.white
+        case let name where name.hasPrefix("custom_"):
+            let hex = String(name.dropFirst(7))
+            return NSColor(hex: hex) ?? .white
         default: return NSColor.white
         }
     }
@@ -577,6 +594,14 @@ class AppConfig: ObservableObject {
     func markFusionOverloadWarningShown() {
         hasShownFusionOverloadWarning = true
     }
+
+    func shouldSuppressMultiWindowTip() -> Bool {
+        suppressMultiWindowTip
+    }
+
+    func setSuppressMultiWindowTip(_ suppressed: Bool) {
+        suppressMultiWindowTip = suppressed
+    }
     
     // MARK: - Hidden Window Recovery Support
     
@@ -704,5 +729,31 @@ class AppConfig: ObservableObject {
                 process.waitUntilExit()
             }
         }
+    }
+}
+
+// MARK: - NSColor Hex 扩展
+
+extension NSColor {
+    convenience init?(hex: String) {
+        var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
+        guard hexSanitized.count == 6 else { return nil }
+        var rgb: UInt64 = 0
+        Scanner(string: hexSanitized).scanHexInt64(&rgb)
+        self.init(
+            red: CGFloat((rgb & 0xFF0000) >> 16) / 255.0,
+            green: CGFloat((rgb & 0x00FF00) >> 8) / 255.0,
+            blue: CGFloat(rgb & 0x0000FF) / 255.0,
+            alpha: 1.0
+        )
+    }
+    
+    func toHex() -> String? {
+        guard let rgbColor = self.usingColorSpace(.sRGB) else { return nil }
+        let r = Int(round(rgbColor.redComponent * 255))
+        let g = Int(round(rgbColor.greenComponent * 255))
+        let b = Int(round(rgbColor.blueComponent * 255))
+        return String(format: "%02X%02X%02X", r, g, b)
     }
 }
