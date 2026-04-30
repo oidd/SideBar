@@ -1,0 +1,768 @@
+import Foundation
+import Combine
+import AppKit
+import ServiceManagement
+
+extension NSNotification.Name {
+    static let menuBarIconVisibilityChanged = NSNotification.Name("menuBarIconVisibilityChanged")
+}
+
+struct AppSettings: Codable, Equatable {
+    var isEnabled: Bool
+    var colorName: String // e.g. "orange", "blue", "green"
+    var opacity: Double? // 可选类型确保与旧本地存档的向后兼容
+    var snapSide: String? // left / right / leftRight
+    var shortcutModifiers: UInt? // NSEvent.ModifierFlags.rawValue
+    var shortcutKeyCode: UInt16? // 键码
+}
+
+struct PersistedPoint: Codable, Equatable {
+    var x: CGFloat
+    var y: CGFloat
+
+    init(_ point: CGPoint) {
+        self.x = point.x
+        self.y = point.y
+    }
+
+    var cgPoint: CGPoint {
+        CGPoint(x: x, y: y)
+    }
+}
+
+struct PersistedRect: Codable, Equatable {
+    var x: CGFloat
+    var y: CGFloat
+    var width: CGFloat
+    var height: CGFloat
+
+    init(_ rect: CGRect) {
+        self.x = rect.origin.x
+        self.y = rect.origin.y
+        self.width = rect.width
+        self.height = rect.height
+    }
+
+    var cgRect: CGRect {
+        CGRect(x: x, y: y, width: width, height: height)
+    }
+}
+
+struct WindowRescueRecord: Codable, Equatable {
+    var bundleID: String
+    var pid: pid_t
+    var windowID: UInt32
+    var edge: Int
+    var visibleFrame: PersistedRect
+    var safeRestorePosition: PersistedPoint
+    var displayFrame: PersistedRect
+    var updatedAt: TimeInterval
+}
+
+enum DockAvoidanceMode: String, CaseIterable {
+    case automatic
+    case left
+    case right
+    case bottom
+}
+
+enum UpdateCheckFrequency: Int, CaseIterable {
+    case never = 0
+    case everyLaunch = 1
+    case weekly = 2
+}
+
+class AppConfig: ObservableObject {
+    static let shared = AppConfig()
+    static let defaultHoverTolerance: CGFloat = 60
+    static let maxHoverToleranceX: CGFloat = 400
+    static let maxHoverToleranceY: CGFloat = 400
+    private var temporaryDockMinimizeExcludedBundleIDs: Set<String> = []
+    
+    // Key: Bundle ID, Value: Config
+    @Published var appSettings: [String: AppSettings] {
+        didSet {
+            save()
+            // 发送通知，让后台重新加载会话并应用新属性
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+    
+    private let defaultsKey = "SideBarAppConfigurations"
+    private let snapRecordsKey = "SideBarHiddenWindowRecords"
+    private let rescueRecordsKey = "SideBarWindowRescueRecords"
+    private let visualEffectEnabledKey = "SideBarVisualEffectEnabled"
+    private let fusionStripEnabledKey = "SideBarFusionStripEnabled"
+    private let fusionOverloadWarningShownKey = "SideBarFusionOverloadWarningShown"
+    private let mirrorPinEnabledKey = "SideBarMirrorPinEnabled"
+    private let suppressMultiWindowTipKey = "SideBarSuppressMultiWindowTip"
+    private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
+    private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
+    private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
+    private let updateCheckFrequencyKey = "SideBarUpdateCheckFrequency"
+    private let lastSuccessfulUpdateCheckAtKey = "SideBarLastSuccessfulUpdateCheckAt"
+    
+    // 格式: "PID:WindowID"
+    @Published var hiddenWindowRecords: [String] = [] {
+        didSet {
+            UserDefaults.standard.set(hiddenWindowRecords, forKey: snapRecordsKey)
+        }
+    }
+
+    @Published var windowRescueRecords: [WindowRescueRecord] = [] {
+        didSet {
+            if let encoded = try? JSONEncoder().encode(windowRescueRecords) {
+                UserDefaults.standard.set(encoded, forKey: rescueRecordsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: rescueRecordsKey)
+            }
+        }
+    }
+    
+    @Published var hoverTolerance: CGFloat = 60 {
+        didSet {
+            let clamped = Self.clamp(hoverTolerance, max: Self.maxHoverToleranceX)
+            if hoverTolerance != clamped {
+                hoverTolerance = clamped
+                return
+            }
+            UserDefaults.standard.set(hoverTolerance, forKey: "SideBarHoverTolerance")
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+    
+    @Published var hoverToleranceY: CGFloat = 60 {
+        didSet {
+            let clamped = Self.clamp(hoverToleranceY, max: Self.maxHoverToleranceY)
+            if hoverToleranceY != clamped {
+                hoverToleranceY = clamped
+                return
+            }
+            UserDefaults.standard.set(hoverToleranceY, forKey: "SideBarHoverToleranceY")
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+    
+    /// 防误触缓冲（悬停延时）默认值（毫秒）
+    static let defaultHoverDelayMS: Int = 200
+
+    @Published var hoverDelayMS: Int = AppConfig.defaultHoverDelayMS {
+        didSet {
+            UserDefaults.standard.set(hoverDelayMS, forKey: "SideBarHoverDelayMS")
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var temporaryShortcutModifiers: UInt? {
+        didSet {
+            if let temporaryShortcutModifiers {
+                UserDefaults.standard.set(temporaryShortcutModifiers, forKey: temporaryShortcutModifiersKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: temporaryShortcutModifiersKey)
+            }
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var temporaryShortcutKeyCode: UInt16? {
+        didSet {
+            if let temporaryShortcutKeyCode {
+                UserDefaults.standard.set(Int(temporaryShortcutKeyCode), forKey: temporaryShortcutKeyCodeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: temporaryShortcutKeyCodeKey)
+            }
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+    
+    @Published var launchAtLogin: Bool = true {
+        didSet {
+            UserDefaults.standard.set(launchAtLogin, forKey: "SideBarLaunchAtLogin")
+        }
+    }
+    
+    @Published var showInMenuBar: Bool = true {
+        didSet {
+            UserDefaults.standard.set(showInMenuBar, forKey: "SideBarShowInMenuBar")
+            NotificationCenter.default.post(name: .menuBarIconVisibilityChanged, object: nil)
+        }
+    }
+
+    @Published var isVisualEffectEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isVisualEffectEnabled, forKey: visualEffectEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var isFusionStripEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isFusionStripEnabled, forKey: fusionStripEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var hasShownFusionOverloadWarning: Bool = false {
+        didSet {
+            UserDefaults.standard.set(hasShownFusionOverloadWarning, forKey: fusionOverloadWarningShownKey)
+        }
+    }
+
+    @Published var isMirrorPinEnabled: Bool = false {
+        didSet {
+            UserDefaults.standard.set(isMirrorPinEnabled, forKey: mirrorPinEnabledKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var suppressMultiWindowTip: Bool = false {
+        didSet {
+            UserDefaults.standard.set(suppressMultiWindowTip, forKey: suppressMultiWindowTipKey)
+        }
+    }
+    
+    @Published var language: Int = 0 {
+        didSet {
+            UserDefaults.standard.set(language, forKey: "SideBarLanguage")
+        }
+    }
+
+    @Published var dockAvoidanceModeRawValue: String = DockAvoidanceMode.automatic.rawValue {
+        didSet {
+            UserDefaults.standard.set(dockAvoidanceModeRawValue, forKey: dockAvoidanceModeKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var updateCheckFrequencyRawValue: Int = UpdateCheckFrequency.weekly.rawValue {
+        didSet {
+            let normalized = UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue)?.rawValue ?? UpdateCheckFrequency.weekly.rawValue
+            if updateCheckFrequencyRawValue != normalized {
+                updateCheckFrequencyRawValue = normalized
+                return
+            }
+            UserDefaults.standard.set(normalized, forKey: updateCheckFrequencyKey)
+        }
+    }
+
+    private var lastSuccessfulUpdateCheckAt: TimeInterval = 0
+    
+    private init() {
+        self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
+        if let data = UserDefaults.standard.data(forKey: rescueRecordsKey),
+           let decoded = try? JSONDecoder().decode([WindowRescueRecord].self, from: data) {
+            self.windowRescueRecords = decoded
+        } else {
+            self.windowRescueRecords = []
+        }
+        
+        let savedTolerance = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverTolerance"))
+        self.hoverTolerance = savedTolerance > 0
+            ? Self.clamp(savedTolerance, max: Self.maxHoverToleranceX)
+            : Self.defaultHoverTolerance
+        
+        let savedToleranceY = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverToleranceY"))
+        self.hoverToleranceY = savedToleranceY > 0
+            ? Self.clamp(savedToleranceY, max: Self.maxHoverToleranceY)
+            : Self.defaultHoverTolerance
+        
+        // 注意：UserDefaults.integer 在键不存在时会返回 0，因此用 object(forKey:) 区分
+        // 「未配置」与「显式配置为 0」两种情况，前者使用默认值 200ms。
+        if UserDefaults.standard.object(forKey: "SideBarHoverDelayMS") != nil {
+            self.hoverDelayMS = UserDefaults.standard.integer(forKey: "SideBarHoverDelayMS")
+        } else {
+            self.hoverDelayMS = AppConfig.defaultHoverDelayMS
+        }
+
+        if UserDefaults.standard.object(forKey: temporaryShortcutModifiersKey) != nil {
+            self.temporaryShortcutModifiers = UInt(UserDefaults.standard.integer(forKey: temporaryShortcutModifiersKey))
+        } else {
+            self.temporaryShortcutModifiers = nil
+        }
+
+        if UserDefaults.standard.object(forKey: temporaryShortcutKeyCodeKey) != nil {
+            self.temporaryShortcutKeyCode = UInt16(UserDefaults.standard.integer(forKey: temporaryShortcutKeyCodeKey))
+        } else {
+            self.temporaryShortcutKeyCode = nil
+        }
+        
+        if UserDefaults.standard.object(forKey: "SideBarLaunchAtLogin") == nil {
+            self.launchAtLogin = true
+            UserDefaults.standard.set(true, forKey: "SideBarLaunchAtLogin")
+        } else {
+            self.launchAtLogin = UserDefaults.standard.bool(forKey: "SideBarLaunchAtLogin")
+        }
+        
+        if UserDefaults.standard.object(forKey: "SideBarShowInMenuBar") == nil {
+            self.showInMenuBar = true
+            UserDefaults.standard.set(true, forKey: "SideBarShowInMenuBar")
+        } else {
+            self.showInMenuBar = UserDefaults.standard.bool(forKey: "SideBarShowInMenuBar")
+        }
+
+        if UserDefaults.standard.object(forKey: visualEffectEnabledKey) == nil {
+            self.isVisualEffectEnabled = true
+            UserDefaults.standard.set(true, forKey: visualEffectEnabledKey)
+        } else {
+            self.isVisualEffectEnabled = UserDefaults.standard.bool(forKey: visualEffectEnabledKey)
+        }
+
+        if UserDefaults.standard.object(forKey: fusionStripEnabledKey) == nil {
+            self.isFusionStripEnabled = true
+            UserDefaults.standard.set(true, forKey: fusionStripEnabledKey)
+        } else {
+            self.isFusionStripEnabled = UserDefaults.standard.bool(forKey: fusionStripEnabledKey)
+        }
+
+        self.hasShownFusionOverloadWarning = UserDefaults.standard.bool(forKey: fusionOverloadWarningShownKey)
+
+        if UserDefaults.standard.object(forKey: mirrorPinEnabledKey) == nil {
+            self.isMirrorPinEnabled = false
+            UserDefaults.standard.set(false, forKey: mirrorPinEnabledKey)
+        } else {
+            self.isMirrorPinEnabled = UserDefaults.standard.bool(forKey: mirrorPinEnabledKey)
+        }
+
+        if UserDefaults.standard.object(forKey: suppressMultiWindowTipKey) == nil {
+            self.suppressMultiWindowTip = false
+            UserDefaults.standard.set(false, forKey: suppressMultiWindowTipKey)
+        } else {
+            self.suppressMultiWindowTip = UserDefaults.standard.bool(forKey: suppressMultiWindowTipKey)
+        }
+        
+        if UserDefaults.standard.object(forKey: "SideBarLanguage") == nil {
+            let defaultLang = AppLanguage.system.rawValue
+            self.language = defaultLang
+            UserDefaults.standard.set(defaultLang, forKey: "SideBarLanguage")
+        } else {
+            self.language = UserDefaults.standard.integer(forKey: "SideBarLanguage")
+        }
+
+        if let rawMode = UserDefaults.standard.string(forKey: dockAvoidanceModeKey),
+           DockAvoidanceMode(rawValue: rawMode) != nil {
+            self.dockAvoidanceModeRawValue = rawMode
+        } else {
+            self.dockAvoidanceModeRawValue = DockAvoidanceMode.automatic.rawValue
+            UserDefaults.standard.set(DockAvoidanceMode.automatic.rawValue, forKey: dockAvoidanceModeKey)
+        }
+
+        if let savedFrequency = UpdateCheckFrequency(rawValue: UserDefaults.standard.integer(forKey: updateCheckFrequencyKey)),
+           UserDefaults.standard.object(forKey: updateCheckFrequencyKey) != nil {
+            self.updateCheckFrequencyRawValue = savedFrequency.rawValue
+        } else {
+            self.updateCheckFrequencyRawValue = UpdateCheckFrequency.weekly.rawValue
+            UserDefaults.standard.set(UpdateCheckFrequency.weekly.rawValue, forKey: updateCheckFrequencyKey)
+        }
+
+        self.lastSuccessfulUpdateCheckAt = UserDefaults.standard.double(forKey: lastSuccessfulUpdateCheckAtKey)
+        
+        if let data = UserDefaults.standard.data(forKey: defaultsKey),
+           let savedDict = try? JSONDecoder().decode([String: AppSettings].self, from: data) {
+            self.appSettings = savedDict.mapValues { setting in
+                var normalized = setting
+                normalized.snapSide = Self.normalizeSnapSide(setting.snapSide)
+                return normalized
+            }
+        } else {
+            // 兼容老版本的 Set 数据迁移
+            let oldKey = "EnabledSideBarApps"
+            let oldSet = UserDefaults.standard.stringArray(forKey: oldKey) ?? []
+            var newDict: [String: AppSettings] = [:]
+            for bundle in oldSet {
+                newDict[bundle] = AppSettings(isEnabled: true, colorName: "white", snapSide: "leftRight")
+            }
+            self.appSettings = newDict
+        }
+        
+        // 监听系统外观切换，驱动所有 WindowSession 刷新快照条颜色
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleSystemAppearanceChange),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+    }
+    
+    @objc private func handleSystemAppearanceChange() {
+        // 延迟 0.1s 确保系统完成外观切换后再广播
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    private static func clamp(_ value: CGFloat, max: CGFloat) -> CGFloat {
+        Swift.max(0, Swift.min(value, max))
+    }
+    
+    // 全局覆盖所有已启用软件的透明度
+    func setGlobalOpacity(_ opacity: Double) {
+        var updated = appSettings
+        for (key, var setting) in updated {
+            if setting.isEnabled {
+                setting.opacity = opacity
+                updated[key] = setting
+            }
+        }
+        appSettings = updated
+    }
+    
+    private func save() {
+        if let encoded = try? JSONEncoder().encode(appSettings) {
+            UserDefaults.standard.set(encoded, forKey: defaultsKey)
+        }
+        syncDockExclusionsToDockMinimize()
+    }
+    
+    func isAppEnabled(bundleID: String) -> Bool {
+        return appSettings[bundleID]?.isEnabled ?? false
+    }
+    
+    func getColor(for bundleID: String) -> NSColor {
+        let name = appSettings[bundleID]?.colorName ?? "auto"
+        switch name {
+        case "auto":
+            // 动态 NSColor：系统外观变化时自动解析为正确颜色
+            return NSColor(name: nil) { appearance in
+                if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+                    return .white  // 深色模式 → 白色
+                } else {
+                    return .black  // 浅色模式 → 黑色
+                }
+            }
+        case "blue": return NSColor(red: 0.565, green: 0.792, blue: 0.976, alpha: 1)
+        case "green": return NSColor(red: 0.647, green: 0.839, blue: 0.655, alpha: 1)
+        case "red": return NSColor(red: 0.937, green: 0.604, blue: 0.604, alpha: 1)
+        case "yellow": return NSColor(red: 1, green: 0.961, blue: 0.616, alpha: 1)
+        case "purple": return NSColor(red: 0.808, green: 0.576, blue: 0.847, alpha: 1)
+        case "pink": return NSColor(red: 0.957, green: 0.561, blue: 0.694, alpha: 1)
+        case "orange": return NSColor(red: 1, green: 0.8, blue: 0.502, alpha: 1)
+        case "black": return NSColor.black
+        case "white": return NSColor.white
+        case let name where name.hasPrefix("custom_"):
+            let hex = String(name.dropFirst(7))
+            return NSColor(hex: hex) ?? .white
+        default: return NSColor.white
+        }
+    }
+    
+    func getColorName(for bundleID: String) -> String {
+        return appSettings[bundleID]?.colorName ?? "auto"
+    }
+    
+    func getOpacity(for bundleID: String) -> Double {
+        return appSettings[bundleID]?.opacity ?? 1.0
+    }
+
+    func getSnapSide(for bundleID: String) -> String {
+        Self.normalizeSnapSide(appSettings[bundleID]?.snapSide)
+    }
+    
+    func updateOpacity(bundleID: String, opacity: Double) {
+        if var setting = appSettings[bundleID] {
+            setting.opacity = opacity
+            appSettings[bundleID] = setting
+        }
+    }
+
+    func updateSnapSide(bundleID: String, snapSide: String) {
+        if var setting = appSettings[bundleID] {
+            setting.snapSide = Self.normalizeSnapSide(snapSide)
+            appSettings[bundleID] = setting
+        }
+    }
+
+    func setGlobalSnapSide(_ snapSide: String) {
+        var updated = appSettings
+        for (key, var setting) in updated {
+            if setting.isEnabled {
+                setting.snapSide = Self.normalizeSnapSide(snapSide)
+                updated[key] = setting
+            }
+        }
+        appSettings = updated
+    }
+
+    var dockAvoidanceMode: DockAvoidanceMode {
+        DockAvoidanceMode(rawValue: dockAvoidanceModeRawValue) ?? .automatic
+    }
+
+    func setDockAvoidanceMode(_ mode: DockAvoidanceMode) {
+        dockAvoidanceModeRawValue = mode.rawValue
+    }
+
+    var updateCheckFrequency: UpdateCheckFrequency {
+        UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue) ?? .weekly
+    }
+
+    func setUpdateCheckFrequency(_ frequency: UpdateCheckFrequency) {
+        updateCheckFrequencyRawValue = frequency.rawValue
+    }
+
+    func shouldRunAutomaticUpdateCheck(now: Date = Date()) -> Bool {
+        switch updateCheckFrequency {
+        case .never:
+            return false
+        case .everyLaunch:
+            return true
+        case .weekly:
+            guard lastSuccessfulUpdateCheckAt > 0 else { return true }
+            let elapsed = now.timeIntervalSince1970 - lastSuccessfulUpdateCheckAt
+            return elapsed >= 7 * 24 * 60 * 60
+        }
+    }
+
+    func markSuccessfulUpdateCheck(at date: Date = Date()) {
+        lastSuccessfulUpdateCheckAt = date.timeIntervalSince1970
+        UserDefaults.standard.set(lastSuccessfulUpdateCheckAt, forKey: lastSuccessfulUpdateCheckAtKey)
+    }
+
+    func resolvedDockAvoidanceSide() -> String? {
+        switch dockAvoidanceMode {
+        case .automatic:
+            return Self.detectDockOrientation()
+        case .left, .right, .bottom:
+            return dockAvoidanceMode.rawValue
+        }
+    }
+    
+    func updateApp(bundleID: String, isEnabled: Bool, colorName: String) {
+        let existing = appSettings[bundleID]
+        appSettings[bundleID] = AppSettings(
+            isEnabled: isEnabled,
+            colorName: colorName,
+            opacity: existing?.opacity ?? 1.0,
+            snapSide: Self.normalizeSnapSide(existing?.snapSide),
+            shortcutModifiers: existing?.shortcutModifiers,
+            shortcutKeyCode: existing?.shortcutKeyCode
+        )
+    }
+    
+    func toggleApp(bundleID: String, isEnabled: Bool) {
+        let existing = appSettings[bundleID]
+        appSettings[bundleID] = AppSettings(
+            isEnabled: isEnabled,
+            colorName: existing?.colorName ?? "auto",
+            opacity: existing?.opacity ?? 1.0,
+            snapSide: Self.normalizeSnapSide(existing?.snapSide),
+            shortcutModifiers: existing?.shortcutModifiers,
+            shortcutKeyCode: existing?.shortcutKeyCode
+        )
+    }
+    
+    func setShortcut(bundleID: String, modifiers: UInt, keyCode: UInt16) {
+        if var setting = appSettings[bundleID] {
+            setting.shortcutModifiers = modifiers
+            setting.shortcutKeyCode = keyCode
+            appSettings[bundleID] = setting
+        }
+    }
+    
+    func clearShortcut(bundleID: String) {
+        if var setting = appSettings[bundleID] {
+            setting.shortcutModifiers = nil
+            setting.shortcutKeyCode = nil
+            appSettings[bundleID] = setting
+        }
+    }
+
+    func setTemporaryShortcut(modifiers: UInt, keyCode: UInt16) {
+        temporaryShortcutModifiers = modifiers
+        temporaryShortcutKeyCode = keyCode
+    }
+
+    func clearTemporaryShortcut() {
+        temporaryShortcutModifiers = nil
+        temporaryShortcutKeyCode = nil
+    }
+
+    func setTemporaryDockMinimizeExclusion(bundleID: String, excluded: Bool) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.setTemporaryDockMinimizeExclusion(bundleID: bundleID, excluded: excluded)
+            }
+            return
+        }
+
+        let changed: Bool
+        if excluded {
+            let (inserted, _) = temporaryDockMinimizeExcludedBundleIDs.insert(bundleID)
+            changed = inserted
+        } else {
+            changed = temporaryDockMinimizeExcludedBundleIDs.remove(bundleID) != nil
+        }
+
+        if changed {
+            syncDockExclusionsToDockMinimize()
+        }
+    }
+
+    func refreshDockMinimizeBridgeExports() {
+        syncDockExclusionsToDockMinimize()
+    }
+
+    func markFusionOverloadWarningShown() {
+        hasShownFusionOverloadWarning = true
+    }
+
+    func shouldSuppressMultiWindowTip() -> Bool {
+        suppressMultiWindowTip
+    }
+
+    func setSuppressMultiWindowTip(_ suppressed: Bool) {
+        suppressMultiWindowTip = suppressed
+    }
+    
+    // MARK: - Hidden Window Recovery Support
+    
+    func addHiddenWindowRecord(pid: pid_t, windowID: UInt32) {
+        let record = "\(pid):\(windowID)"
+        if !hiddenWindowRecords.contains(record) {
+            hiddenWindowRecords.append(record)
+        }
+    }
+    
+    func removeHiddenWindowRecord(pid: pid_t, windowID: UInt32) {
+        let record = "\(pid):\(windowID)"
+        hiddenWindowRecords.removeAll { $0 == record }
+    }
+
+    func upsertWindowRescueRecord(_ record: WindowRescueRecord) {
+        if let index = windowRescueRecords.firstIndex(where: { $0.pid == record.pid && $0.windowID == record.windowID }) {
+            windowRescueRecords[index] = record
+        } else {
+            windowRescueRecords.append(record)
+        }
+    }
+
+    func removeWindowRescueRecord(pid: pid_t, windowID: UInt32) {
+        windowRescueRecords.removeAll { $0.pid == pid && $0.windowID == windowID }
+    }
+
+    func removeWindowRescueRecords(pid: pid_t, windowIDs: [UInt32]) {
+        let ids = Set(windowIDs)
+        hiddenWindowRecords.removeAll { record in
+            let parts = record.split(separator: ":")
+            guard parts.count == 2,
+                  let recordPID = pid_t(parts[0]),
+                  let recordWindowID = UInt32(parts[1]) else {
+                return false
+            }
+            return recordPID == pid && ids.contains(recordWindowID)
+        }
+        windowRescueRecords.removeAll { $0.pid == pid && ids.contains($0.windowID) }
+    }
+
+    func hasPendingWindowRescueRecords() -> Bool {
+        !windowRescueRecords.isEmpty || !hiddenWindowRecords.isEmpty
+    }
+    
+    // MARK: - 跨应用联动 (SideBar ↔ DockMinimize)
+    
+    private func syncDockExclusionsToDockMinimize() {
+        let enabledBundleIDs = appSettings
+            .filter { $0.value.isEnabled }
+            .map(\.key)
+        let temporaryExcludedBundleIDs = Array(temporaryDockMinimizeExcludedBundleIDs)
+        let mergedBundleIDs = Array(Set(enabledBundleIDs).union(temporaryExcludedBundleIDs)).sorted()
+
+        var reasons: [String: [String]] = [:]
+        for bundleID in enabledBundleIDs {
+            reasons[bundleID, default: []].append("enabled_in_sidebar")
+        }
+        for bundleID in temporaryExcludedBundleIDs {
+            reasons[bundleID, default: []].append("temporary_exclusion")
+        }
+
+        SideBarBridge.shared.exportDockExclusions(bundleIDs: mergedBundleIDs, reasons: reasons)
+    }
+    
+    /// 检测 DockMinimize 是否正在运行
+    static func isDockMinimizeRunning() -> Bool {
+        return !NSRunningApplication.runningApplications(withBundleIdentifier: "com.dockminimize.app").isEmpty
+    }
+
+    private static func normalizeSnapSide(_ rawValue: String?) -> String {
+        switch rawValue {
+        case "both", "leftRight":
+            return "leftRight"
+        case "left", "right":
+            return rawValue ?? "leftRight"
+        case "bottom", "leftBottom", "rightBottom", "leftRightBottom":
+            return "leftRight"
+        default:
+            return "leftRight"
+        }
+    }
+
+    static func detectDockOrientation() -> String? {
+        if let orientation = UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation"),
+           ["left", "right", "bottom"].contains(orientation) {
+            return orientation
+        }
+
+        if let persistentDomain = UserDefaults.standard.persistentDomain(forName: "com.apple.dock"),
+           let orientation = persistentDomain["orientation"] as? String,
+           ["left", "right", "bottom"].contains(orientation) {
+            return orientation
+        }
+
+        return nil
+    }
+    
+    func updateLaunchAtLogin(_ enable: Bool) {
+        if #available(macOS 13.0, *) {
+            let service = SMAppService.mainApp
+            print("[SideBar] SMAppService current status: \(service.status.rawValue), attempting to \(enable ? "register" : "unregister")")
+            do {
+                if enable {
+                    try service.register()
+                    print("[SideBar] SMAppService register succeeded, new status: \(service.status.rawValue)")
+                } else {
+                    try service.unregister()
+                    print("[SideBar] SMAppService unregister succeeded, new status: \(service.status.rawValue)")
+                }
+            } catch {
+                print("[SideBar] SMAppService \(enable ? "register" : "unregister") failed: \(error)")
+            }
+        } else {
+            // macOS 12 及以下，回退到 osascript
+            let appPath = Bundle.main.bundlePath
+            let script = enable
+                ? "tell application \"System Events\" to make login item at end with properties {path:\"\(appPath)\", hidden:false, name:\"SideBar\"}"
+                : "tell application \"System Events\" to delete login item \"SideBar\""
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", script]
+                try? process.run()
+                process.waitUntilExit()
+            }
+        }
+    }
+}
+
+// MARK: - NSColor Hex 扩展
+
+extension NSColor {
+    convenience init?(hex: String) {
+        var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
+        guard hexSanitized.count == 6 else { return nil }
+        var rgb: UInt64 = 0
+        Scanner(string: hexSanitized).scanHexInt64(&rgb)
+        self.init(
+            red: CGFloat((rgb & 0xFF0000) >> 16) / 255.0,
+            green: CGFloat((rgb & 0x00FF00) >> 8) / 255.0,
+            blue: CGFloat(rgb & 0x0000FF) / 255.0,
+            alpha: 1.0
+        )
+    }
+    
+    func toHex() -> String? {
+        guard let rgbColor = self.usingColorSpace(.sRGB) else { return nil }
+        let r = Int(round(rgbColor.redComponent * 255))
+        let g = Int(round(rgbColor.greenComponent * 255))
+        let b = Int(round(rgbColor.blueComponent * 255))
+        return String(format: "%02X%02X%02X", r, g, b)
+    }
+}
