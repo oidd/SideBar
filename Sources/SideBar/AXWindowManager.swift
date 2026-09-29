@@ -38,6 +38,16 @@ class AXWindowManager {
         // 监听新应用启动
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidLaunch), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+
+        // 关键修复：监听屏幕配置变化（外接显示器热插拔、分辨率切换、显示器排列调整）。
+        // 缺少此监听时，WindowSession 的 snappedScreen/snappedDisplayBounds 会指向已失效的
+        // "幽灵屏幕"，导致快照条位置错乱、窗口卡在不可见坐标，必须重启进程才能恢复。
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleScreenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
         
         // 启动时同步一次所有运行中应用
         synchronizeSessions()
@@ -119,7 +129,7 @@ class AXWindowManager {
         
         for (pid, info) in appObservers {
             if !runningPIDs.contains(pid) {
-                CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), info.1, .defaultMode)
                 appObservers.removeValue(forKey: pid)
             }
         }
@@ -143,6 +153,37 @@ class AXWindowManager {
     }
 
     @objc private func handleActiveSpaceDidChange() {
+        fusionCoordinator.resetForSpaceChange(sessions: sessions)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            guard let self else { return }
+            self.fusionCoordinator.reconcile(sessions: self.sessions)
+        }
+    }
+
+    /// 屏幕配置发生变化（拔/插显示器、分辨率切换、显示器排列改变）。
+    /// 对每个锁定几何已失效的 session：**优先就地重贴**（同物理显示器只是变分辨率的常见场景），
+    /// 找不到对应新屏时才退化为"复位到主屏可见区域 + 状态机降级为 floating"的安全兜底。
+    /// 同时让融合条按新的屏幕几何重新组装，避免快照条出现在"幽灵屏幕"的坐标上。
+    @objc private func handleScreenParametersChanged() {
+        let activeScreens = NSScreen.screens
+        var reseated = 0
+        var recovered = 0
+        for session in sessions {
+            guard session.snappedScreenIsStale(in: activeScreens) else { continue }
+            // 先尝试就地重贴——同一块物理显示器切换分辨率是最常见的场景，
+            // 直接把用户的吸附窗口和快照条搬到新几何上，保留吸附意图。
+            if session.reseatSnappedGeometryIfPossible(in: activeScreens) {
+                reseated += 1
+            } else {
+                // 找不到对应新屏（真的拔了外接屏），走安全兜底。
+                session.recoverFromScreenParametersChange()
+                recovered += 1
+            }
+        }
+        if reseated + recovered > 0 {
+            print("🖥️ 检测到屏幕配置变化: reseat=\(reseated), recover=\(recovered)")
+        }
+
         fusionCoordinator.resetForSpaceChange(sessions: sessions)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }
@@ -179,7 +220,7 @@ class AXWindowManager {
         sessionSyncTimer = nil
         
         for (_, info) in appObservers {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), info.1, .defaultMode)
         }
         appObservers.removeAll()
 
@@ -231,7 +272,7 @@ class AXWindowManager {
         sessionSyncTimer = nil
 
         for (_, info) in appObservers {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), info.1, .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), info.1, .defaultMode)
         }
         appObservers.removeAll()
 
@@ -307,7 +348,9 @@ class AXWindowManager {
                 )
                 guard addResult == .success else { return }
                 let runLoopSource = AXObserverGetRunLoopSource(observer)
-                CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
+                // 显式绑定到主 run loop：保证 AX 回调始终在主线程，且 cleanup/suspend 时
+                // 能从同一 run loop 上拆除，避免在错误的 run loop 上调用造成 source 残留。
+                CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
                 appObservers[pid] = (observer, runLoopSource)
             }
         }
@@ -385,11 +428,13 @@ class AXWindowManager {
     }
     
     private func setupGlobalMouseMonitor() {
-        globalMouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { _ in
+        globalMouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             WindowSession.noteGlobalMouseDown()
+            self?.sessions.forEach { $0.handleMouseDown() }
         }
-        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             WindowSession.noteGlobalMouseDown()
+            self?.sessions.forEach { $0.handleMouseDown() }
             return event
         }
 

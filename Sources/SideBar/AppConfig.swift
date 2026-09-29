@@ -180,6 +180,11 @@ class AppConfig: ObservableObject {
             UserDefaults.standard.set(launchAtLogin, forKey: "SideBarLaunchAtLogin")
         }
     }
+
+    /// 标记为 true 时，`SettingsView` 中对 `launchAtLogin` 的 `onChange` 监听
+    /// 应当跳过对 `updateLaunchAtLogin(_:)` 的调用，避免回滚动作再次触发系统请求。
+    /// 仅在 `updateLaunchAtLogin` 注册失败需要把开关回滚到旧值时由内部短暂置位。
+    var suppressLaunchAtLoginSync: Bool = false
     
     @Published var showInMenuBar: Bool = true {
         didSet {
@@ -723,6 +728,28 @@ class AppConfig: ObservableObject {
                 }
             } catch {
                 print("[SideBar] SMAppService \(enable ? "register" : "unregister") failed: \(error)")
+                // 关键修复：注册/反注册失败时，UI 上的开关已经显示为新值，但系统层面并未生效。
+                // 必须把 launchAtLogin 回滚到失败前，并弹一个错误提示，让用户知道真实状态。
+                // 通过 suppressLaunchAtLoginSync 防止 SettingsView 的 onChange 再次调本函数，
+                // 避免反复重试同一个会失败的操作。
+                //
+                // 关键时序：SwiftUI 的 `onChange(of:)` 一般在下一帧才会派发，而 `runModal()`
+                // 会同步阻塞主线程直到用户关闭对话框。因此抑制标志的复位必须放在 runModal
+                // **之后**——否则用户关闭对话框时 onChange 才刚被派发，那时若抑制标志已被
+                // 复位，回滚事件就会被当成正常用户操作触发又一次 updateLaunchAtLogin。
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    let revertedValue = !enable
+                    UserDefaults.standard.set(revertedValue, forKey: "SideBarLaunchAtLogin")
+                    if self.launchAtLogin != revertedValue {
+                        self.suppressLaunchAtLoginSync = true
+                        self.launchAtLogin = revertedValue
+                        // 注意：不要在这里把 suppressLaunchAtLoginSync 复位为 false，
+                        // 必须等 runModal 退出后（即 SwiftUI 的 onChange 派发已经走完）再复位。
+                    }
+                    self.presentLaunchAtLoginFailureAlert(enableAttempt: enable, error: error)
+                    self.suppressLaunchAtLoginSync = false
+                }
             }
         } else {
             // macOS 12 及以下，回退到 osascript
@@ -736,6 +763,26 @@ class AppConfig: ObservableObject {
                 process.arguments = ["-e", script]
                 try? process.run()
                 process.waitUntilExit()
+            }
+        }
+    }
+
+    private func presentLaunchAtLoginFailureAlert(enableAttempt: Bool, error: Error) {
+        let alert = NSAlert()
+        alert.messageText = enableAttempt
+            ? "无法开启开机自启动".localized
+            : "无法关闭开机自启动".localized
+        let template = "系统拒绝了 SideBar 的登录项请求：\n\n%@\n\n请前往 系统设置 → 通用 → 登录项 手动调整 SideBar 的登录项状态。".localized
+        alert.informativeText = String(format: template, error.localizedDescription)
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "打开系统设置".localized)
+        alert.addButton(withTitle: "知道了".localized)
+        alert.window.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+                NSWorkspace.shared.open(url)
             }
         }
     }

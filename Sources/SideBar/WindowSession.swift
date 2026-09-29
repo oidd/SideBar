@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreVideo
+import ScreenCaptureKit
 
 enum SnapState: Equatable {
     case floating
@@ -27,6 +28,7 @@ private struct VisibleAppWindowSample {
 private enum GlobalClickRegion {
     case dock
     case menuBar
+    case notificationBanner
     case content
     case unknown
 }
@@ -40,6 +42,8 @@ private struct GlobalMouseDownSample {
 private enum ExplicitRevealTrigger {
     case dockClick
     case appSwitch
+    case notificationClick
+    case menuBarClick
 }
 
 private struct ExplicitRevealIntent {
@@ -130,6 +134,15 @@ class WindowSession {
     /// 核心原则：窗口被隐藏/折叠后位置已不在原始屏幕内，动态检测会失败，因此必须锁定。
     private var snappedDisplayBounds: CGRect?
     private var snappedScreen: NSScreen?
+    /// AppKit 坐标下 `snappedScreen` 在**锁定瞬间**的 `frame` 值快照。
+    /// 这是跨屏幕参数变化时判定"锁定的物理显示器是否发生几何变化"的**唯一可靠依据**。
+    ///
+    /// 为什么不直接读 `snappedScreen.frame`：`NSScreen.frame` 是 live getter，macOS 在
+    /// **纯分辨率切换**时会**复用**同一个 NSScreen 实例并原地更新它的 `frame`，读出来
+    /// 已经是"新"分辨率——与 `NSScreen.screens` 中它自己完全匹配，会把真实发生了的
+    /// 几何变化误判为"未变化"，导致锁定的 `snappedDisplayBounds` 一直停留在旧值，
+    /// 隐藏窗口和快照条永远画在已不存在的旧坐标上。
+    private var snappedScreenFrame: CGRect?
     
     /// 获取窗口所在屏幕的 CG 坐标系 bounds
     /// 吸附状态下使用锁定值，浮动状态下动态检测
@@ -222,13 +235,185 @@ class WindowSession {
     /// 在吸附时锁定当前屏幕信息
     private func lockCurrentScreen() {
         snappedDisplayBounds = detectDisplayBounds()
-        snappedScreen = detectScreen()
+        let screen = detectScreen()
+        snappedScreen = screen
+        // 关键：这里必须存 frame 的**值快照**，不是引用。原因见 snappedScreenFrame 注释。
+        snappedScreenFrame = screen.frame
     }
     
     /// 取消吸附时清空屏幕锁定
     private func unlockScreen() {
         snappedDisplayBounds = nil
         snappedScreen = nil
+        snappedScreenFrame = nil
+    }
+
+    /// 由 AXWindowManager 在屏幕参数变化时调用，判断本 session 之前锁定的屏幕
+    /// 是否仍然存在于当前 `NSScreen.screens` 中。
+    /// - Returns: `true` 表示锁定的屏幕已消失（典型场景：拔掉外接显示器、分辨率变化），需要主动复位。
+    func snappedScreenIsStale(in activeScreens: [NSScreen]) -> Bool {
+        // 用锁定**瞬间**的 frame 值快照做几何匹配。绝对不能读 `snappedScreen.frame`：
+        // 那是 live getter，macOS 在纯分辨率切换时会复用同一实例并原地更新 frame，
+        // 读出来是"新"值，反而误判为未变化（这正是老版本导致快照条错位、窗口卡死的根因）。
+        guard let lockedFrame = snappedScreenFrame else { return false }
+        let stillExists = activeScreens.contains { screen in
+            let f = screen.frame
+            return abs(f.origin.x - lockedFrame.origin.x) < 1 &&
+                   abs(f.origin.y - lockedFrame.origin.y) < 1 &&
+                   abs(f.width  - lockedFrame.width)  < 1 &&
+                   abs(f.height - lockedFrame.height) < 1
+        }
+        return !stillExists
+    }
+
+    /// 屏幕参数变化时的**就地重贴**路径（优先于 `recoverFromScreenParametersChange`）。
+    ///
+    /// 场景：同一块物理显示器只是切换了分辨率——`snappedScreenFrame` 快照与任何 live NSScreen
+    /// 都不再匹配（`snappedScreenIsStale == true`），但仍能找到一块 live NSScreen 与旧的
+    /// `snappedDisplayBounds` 有大量重叠（或原点几乎不变），说明用户想要的边缘还存在。
+    /// 这时不应该把窗口扔回主屏中心，而应该把锁定信息迁移到新几何、把隐藏窗口和快照条
+    /// 一起搬到新分辨率下的对应边缘，保留用户的吸附意图。
+    ///
+    /// - Returns: 成功迁移则返回 `true`；找不到"对得上"的新屏幕则返回 `false`，
+    ///   由调用方走 `recoverFromScreenParametersChange()` 兜底路径。
+    func reseatSnappedGeometryIfPossible(in activeScreens: [NSScreen]) -> Bool {
+        guard let oldDisplayBounds = snappedDisplayBounds else { return false }
+        guard !activeScreens.isEmpty else { return false }
+
+        // 一次性计算所有 live 屏幕的 CG bounds。复用 `cgBounds(for:)` 助手（line 1118），
+        // 确保 NSScreen→CG 坐标转换公式在整份代码里**只有一处定义**——这正是本次修复
+        // 要根除的"坐标口径漂移"这一类 bug 的同源风险。
+        // 注意：此时 `NSScreen.screens` 已经反映新的屏幕配置，`primaryScreenHeight`（cgBounds
+        // 内部使用）也已是新值。
+        let candidates: [(screen: NSScreen, cg: CGRect)] = activeScreens.map { ($0, cgBounds(for: $0)) }
+
+        // Pass 1：与旧 snappedDisplayBounds 有最大重叠面积的屏（覆盖 90% 的场景，
+        // 也就是"同一物理显示器切换分辨率"）。
+        var bestOverlap: (screen: NSScreen, cg: CGRect, area: CGFloat)?
+        for c in candidates {
+            let inter = c.cg.intersection(oldDisplayBounds)
+            let area = max(inter.width, 0) * max(inter.height, 0)
+            guard area > 0 else { continue }
+            if bestOverlap == nil || area > bestOverlap!.area {
+                bestOverlap = (c.screen, c.cg, area)
+            }
+        }
+
+        // Pass 2 兜底：若分辨率大幅缩水导致完全无重叠，仍允许"CG 原点足够接近"的
+        // 屏幕作为候选（如 4K 外接屏 3840x2160 缩到 1920x1080 且窗口在旧屏最右侧的极端场景）。
+        // 两个 pass 共用同一份 `candidates`，避免未来只改其中一处阈值造成"两 pass 挑不同屏"的 drift。
+        let reseatCandidate: (screen: NSScreen, cg: CGRect)? = {
+            if let best = bestOverlap { return (best.screen, best.cg) }
+            return candidates.first {
+                abs($0.cg.minX - oldDisplayBounds.minX) < 40 &&
+                abs($0.cg.minY - oldDisplayBounds.minY) < 40
+            }
+        }()
+
+        guard let match = reseatCandidate else { return false }
+
+        // 更新所有锁定值到新几何。之后 `getDisplayBounds()`/`edgeGeometry` 都会用新坐标。
+        snappedScreen = match.screen
+        snappedScreenFrame = match.screen.frame
+        snappedDisplayBounds = match.cg
+
+        // 只有处于吸附态（.snapped）时，才需要把物理窗口和快照条也搬到新边缘；
+        // .expanded 或 .floating 让后续正常操作自然收敛即可。
+        guard case .snapped = state else {
+            print("🖥️ \(bundleID) 分辨率变化：仅更新锁定几何 (\(oldDisplayBounds) → \(match.cg))")
+            return true
+        }
+
+        guard let rawFrame = getRawWindowFrame() else {
+            print("🖥️ \(bundleID) 分辨率变化：锁定已更新，但无法读取窗口 frame，跳过几何搬迁")
+            return true
+        }
+
+        // Y 钳制：旧的 `rawFrame.minY` 是在**旧屏几何**下算出来的。若新屏更矮（如 4K→1080p
+        // 或旋转导致高度骤降），原样透传给 `edgeGeometry` 会让窗口 Y 落在新屏之外，
+        // 表现为"边缘有快照条，展开却看不见窗口"。这里先把 Y 钳制到新 bounds 的可见区间。
+        let adjustedFrame = clampFrameYToBounds(rawFrame, bounds: match.cg)
+
+        guard let geometry = edgeGeometry(for: adjustedFrame) else {
+            print("🖥️ \(bundleID) 分辨率变化：无法基于新几何计算 edge 位置，跳过搬迁")
+            return true
+        }
+
+        // 停掉任何仍指向旧坐标的动画，避免动画中途把窗口拉回旧 X。
+        windowAnimator.stop()
+
+        // 把物理窗口搬到新边缘的 visualHidden 位置（AppKit 坐标下）。
+        setWindowPosition(position: geometry.visualHidden)
+
+        // 保持隐藏 alpha，并顺带刷新持久化救援记录中的 displayFrame（用新的 getDisplayBounds()）。
+        let visibleFrame = CGRect(origin: geometry.expanded, size: adjustedFrame.size)
+        setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: visibleFrame)
+
+        // 让快照条回到新屏的正确坐标（此时 showIndicator 内部读的 getDisplayBounds 已是新值）。
+        indicatorWindow.alphaValue = 1.0
+        showIndicator(animated: false)
+        updatePinControlWindow()
+
+        // 状态机里记录的 hiddenX 也需要更新到新几何下的 sentinel 值。
+        state = .snapped(edge: currentEdge, hiddenOrX: geometry.hidden.x)
+
+        print("🖥️ \(bundleID) 分辨率变化：已就地重贴到新几何 (\(oldDisplayBounds) → \(match.cg))")
+        return true
+    }
+
+    /// 把窗口 frame 的 Y 钳制到目标 CG bounds 的可见范围内，留出上下 20pt 的安全边距。
+    /// 用于分辨率缩水场景：若新屏比窗口还矮（`safeMaxY <= safeMinY`）就先保留原 Y，
+    /// 让后续 hover 展开逻辑或用户手动操作自然收敛。
+    private func clampFrameYToBounds(_ frame: CGRect, bounds: CGRect) -> CGRect {
+        let margin: CGFloat = 20
+        let safeMinY = bounds.minY + margin
+        let safeMaxY = bounds.maxY - frame.height - margin
+        guard safeMaxY > safeMinY else { return frame }
+        var adjusted = frame
+        adjusted.origin.y = min(max(frame.minY, safeMinY), safeMaxY)
+        return adjusted
+    }
+
+    /// 当锁定的屏幕已消失时调用：把窗口安全复位到主屏可见区域中心，并把状态机降级为 .floating，
+    /// 让用户重新拖拽即可恢复吸附。绝不强行帮用户决定窗口应该出现在哪一块新屏幕。
+    func recoverFromScreenParametersChange() {
+        print("🖥️ \(bundleID) 锁定屏幕已消失，复位窗口到 floating 态")
+        // 复位前停掉所有可能基于 stale 几何的动画/定时器。
+        windowAnimator.stop()
+        mouseTrackingTimer?.invalidate()
+        hoverDelayTimer?.invalidate()
+        hoverInterruptTimer?.invalidate()
+        pinnedRaiseTimer?.invalidate()
+        mirrorGeometryTimer?.invalidate()
+        effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
+        indicatorWindow.orderOut(nil)
+        pinControlWindow.orderOut(nil)
+        teardownMirrorCapture()
+
+        // 复位 alpha，防止窗口长期保持 0.01 在屏幕外。
+        setWindowAlpha(1.0, isHidden: false, preserveRecoveryRecord: true)
+
+        // 安全位置：用主屏中心兜底，避免窗口飞到屏幕外永远找不到。
+        if let mainScreen = NSScreen.main ?? NSScreen.screens.first,
+           let frame = getRawWindowFrame() {
+            let safeFrame = mainScreen.visibleFrame
+            let targetX = safeFrame.midX - frame.width / 2
+            // AppKit 的 visibleFrame 原点在左下角；AX 的坐标原点在主屏左上角。
+            // primaryScreenHeight 表示主屏高度，转换公式与 showIndicator 中保持一致。
+            let targetY = primaryScreenHeight - safeFrame.midY - frame.height / 2
+            axSetPositionAttribute(
+                on: windowElement,
+                position: CGPoint(x: targetX, y: targetY),
+                context: "WindowSession.recoverFromScreenParametersChange.position"
+            )
+        }
+
+        // 降级到 floating：清空 snappedScreen/snappedDisplayBounds 等锁定状态，
+        // 让用户重新拖拽窗口靠近边缘即可重新吸附。
+        transitionToFloatingFromManagedState(
+            notifyOwnerChange: true,
+            restoreVisiblePositionIfNeeded: false
+        )
     }
     
     /// 判断在指定屏幕的某侧是否紧贴着另一块屏幕（交界处不允许吸附）
@@ -260,7 +445,35 @@ class WindowSession {
     
     private var axObserver: AXObserver?
     private var observerRunLoopSource: CFRunLoopSource?
-    private var isAnimating = false
+    private var isAnimating = false {
+        didSet {
+            // 记录最近一次进入动画态的时间戳，供 stateWatchdogTimer 做超时兜底。
+            // 仅在从 false → true 的瞬间打戳；中途反复设 true 不重新计时也无所谓，
+            // 因为 watchdog 的判定阈值远大于任何合理动画时长。
+            if isAnimating && !oldValue {
+                isAnimatingSince = Date()
+                // 任何 false → true 转换都视作"新一次动画开始"，让所有已挂起的
+                // 延迟 isAnimating 复位闭包（例如 expandWindow(isDockActivated:) 的
+                // 150ms 稳定窗口）通过 token 校验失败而放弃复位，避免误将新动画
+                // 的 isAnimating 打回 false 而破坏其不变式。
+                animationGenerationToken &+= 1
+            } else if !isAnimating {
+                isAnimatingSince = nil
+            }
+        }
+    }
+    private var isAnimatingSince: Date?
+    /// 动画代号：每次 isAnimating 由 false 转 true 都自增一次。
+    /// 用于让延迟复位闭包（当前唯一使用者是 expandWindow(isDockActivated:) 的
+    /// 150ms 稳定窗口）能通过 token 比对确认自己是否仍然对应当前这段 isAnimating，
+    /// 若期间有新动画启动就放弃复位。
+    private var animationGenerationToken: Int = 0
+    private var stateWatchdogTimer: Timer?
+    private static let stateWatchdogInterval: TimeInterval = 2.0
+    /// `isAnimating` 超时阈值。任何正常的展开/折叠/融合动画都远小于此值；
+    /// 如果跨过这个阈值仍未复位，几乎可以确定是 `WindowAnimator.stop()` 被外力
+    /// 打断后没人再接管 `isAnimating = false`，必须强制复位以恢复 indicator 显隐链路。
+    private static let isAnimatingTimeoutSeconds: TimeInterval = 3.0
     private var isIndicatorSuppressed = false
     private var fusionHoverLock = false
     private var activationSuppressionUntil: Date = .distantPast
@@ -277,6 +490,8 @@ class WindowSession {
     private var effectWindow = VisualEffectOverlayWindow()
     private var pinControlWindow = PinControlWindow()
     private var mirrorOverlayWindow = WindowMirrorOverlayWindow()
+    /// 置顶画面的实时采集器（ScreenCaptureKit）。仅在置顶态期间存在。
+    private var mirrorLiveCapturer: WindowMirrorLiveCapturer?
     private var lastMousePos: CGPoint?
     private var mouseTrackingTimer: Timer?
     private var hoverDelayTimer: Timer?
@@ -297,6 +512,16 @@ class WindowSession {
     private var lastSpaceChangeAt: Date = .distantPast
     private var outsideCollapseCandidateSince: Date?
     private var lastSiblingWindowInteractionAt: Date?
+    /// .expanded 期间"窗口几何已脱离托管边缘"的候选起始时间戳。
+    /// 关键修复（与"展开后偶发快照条消失 + 无法自动折叠"Bug 直接相关）：
+    /// 第三方 App 在 expanded 期间可能因内部布局事件（content 重排、模态弹出、
+    /// 焦点切换、显示器/Dock 配置变化）短暂自行改写自身位置/宽度，导致 AX
+    /// 上报的 minX/maxX 瞬时飘出 managedEdgeDetachTolerance 阈值。原本的
+    /// 单帧硬判定会立刻把 state 静默降级为 .floating，进而 orderOut 快照条、
+    /// invalidate mouseTrackingTimer，链路彻底断开，必须重新拖窗才能恢复。
+    /// 用候选时间戳 + managedEdgeDetachConfirmInterval（250ms）做滞回确认，
+    /// 吸收瞬时抖动；真正的用户拖拽脱边轻易超过该阈值，不会被误抑制。
+    private var edgeDetachCandidateSince: Date?
     /// 取消置顶（普通置顶 / 镜像置顶）后，临时让 checkMouseForCollapse 绕过
     /// "兄弟窗口宽限期"判定，只走纯几何 isOutside。原因：sibling grace 是
     /// 为右键菜单/弹出层这类瞬时子窗口设计的（Phase 55/56），但取消置顶后
@@ -306,21 +531,77 @@ class WindowSession {
     /// 时间到了再回到原有 sibling 防误触逻辑，不影响其他功能。
     private var siblingGraceBypassUntil: Date = .distantPast
 
+    // MARK: - checkMouseForCollapse 性能缓存
+    // 展开窗口期间 mouseTrackingTimer 以 10Hz 调用 checkMouseForCollapse，每次都
+    // 跑 getRawWindowFrame（跨进程 AX 读）+ interactionHitTestFrame（CGWindowList
+    // 全量枚举）+ pinControlFrames（又一次 AX 读）。鼠标静止在窗口内时，这些结果
+    // 完全不变，是稳态 CPU 占用的主要来源。下面这组缓存用于在"输入未变化"时短路。
+    /// 上一次 checkMouseForCollapse 采样到的鼠标位置（量化到 mouseCacheQuantum）。
+    private var lastCheckedMouseLocation: CGPoint?
+    /// 上一次采样判定出的 isOutside 结果。仅当鼠标量化位置未变时才可信。
+    private var lastCheckedIsOutside: Bool?
+    /// interactionHitTestFrame 缓存：值 + 计算时刻。AX 几何抖动回调会主动失效它。
+    private var cachedInteractionHitFrame: CGRect?
+    private var cachedInteractionHitFrameAt: Date = .distantPast
+    /// AX Observer 上报的几何变化次数计数。每次 handleObservedGeometryChange 递增，
+    /// checkMouseForCollapse 据此判断"窗口几何是否在上一帧之后发生了变化"以决定
+    /// 是否复用缓存。比直接比对 frame 更便宜（无需先读一次 AX）。
+    private var observedGeometryChangeToken: Int = 0
+    private var lastCheckedObservedGeometryToken: Int = 0
+    /// 鼠标量化粒度（point）。小于该值的位移被视为"静止"，跳过重计算。
+    private static let mouseCacheQuantum: CGFloat = 3
+
     private var isTemporaryShortcutManaged = false
     private var isTemporarilyPinned = false
+    /// 置顶能力是否处于激活状态：源窗口被钉住后，面板显示实时采集画面。
     private var isMirrorPinActive = false
     private var isMirrorOverlayVisible = false
-    private var mirrorHidesRealWindow = false
-    private var mirrorRefreshTimer: Timer?
+    /// 跟踪源窗口几何（位置/尺寸/所在屏）变化的定时器。仅用于让置顶面板跟随源窗口移动，
+    /// 画面内容由 SCStream 推流，不再依赖此定时器刷新。
+    private var mirrorGeometryTimer: Timer?
+    /// 上一次同步给采集器的源窗口尺寸（point），用于判断是否要 updateOutputDimensions。
+    private var lastMirrorAppliedPointSize: CGSize = .zero
+    /// 上一次跟踪到的源窗口屏，用于跨屏移动后重新解析 SCDisplay。
+    private var lastMirrorScreen: NSScreen?
+    /// 上一次 SCStream 失败时的自动重启时间戳，用于在 1.5s 内重复失败时判定为不可恢复。
+    private var lastMirrorCaptureRestartAt: Date = .distantPast
+    /// resize 期间防抖：尺寸稳定 0.35s 后才真正下发 updateOutputDimensions。
+    /// 详见 `syncMirrorGeometryWithSourceWindow` 注释。
+    private var pendingMirrorOutputUpdate: DispatchWorkItem?
+    /// 监听全局/本进程鼠标事件，驱动 sharing ↔ userInteraction 两态机：
+    /// - sharing：SCStream 跑，面板显示画面；
+    /// - userInteraction：SCStream 完全停止，面板从屏幕摘掉，真实窗口以普通方式聚焦。
+    private var mirrorOverlayMouseMonitors: [Any] = []
+    /// 鼠标事件 hit-test 用的源窗口区域缓存（AppKit 坐标系）。
+    /// 仅由 `syncMirrorGeometryWithSourceWindow` (0.18s) 与 `startMirrorCapture` 写入；
+    /// `handleMirrorPointerEvent` 只读这份缓存做几何 contains 判定，
+    /// **不再**在每次 mouseMoved/Dragged 上同步调跨进程 AX (getRawWindowFrame)。
+    /// 60–120Hz × 2 次跨进程 AX 调用全部跑在主线程上，目标 App 繁忙时单次可阻塞数百毫秒，
+    /// 会直接拖垮系统光标——这是必须缓存的关键热点。
+    private var cachedSourceHitFrame: CGRect?
+    /// `syncMirrorGeometryWithSourceWindow` 连续拿不到源窗口 frame 的起始时刻。
+    /// 偶发 nil 不立刻拆置顶（这会让用户 resize 过快、Space 切换等瞬时 miss 都把状态炸掉），
+    /// 仅在持续 ≥ `mirrorGeometryMissTolerance` 后才判定为"源窗口真的没了"，归位置顶态。
+    private var mirrorGeometryMissSince: Date?
+    private static let mirrorGeometryMissTolerance: TimeInterval = 1.0
+    /// 当前是否处于"用户交互态"：鼠标 hover 进入源窗口覆盖区后，立刻完全停止 SCStream，
+    /// 真实窗口此刻就是一个普通聚焦窗口，用户可以正常拖动 / resize / 点击；
+    /// 必须等到用户在源窗口**之外**点击一下，才会重启 SCStream，按当时最新的几何重启画面。
+    /// 这套切换语义彻底回避了 hover 期间面板跟随产生的残影、双窗口、SCStream 高频
+    /// reconfigure 把流挂掉等问题——交互期间 SCStream 根本就没在跑。
+    private var isInUserInteractionMode = false
     private var pinnedAnchor: PinnedAnchor?
     private var pinControlRevealSuppressionUntil: Date = .distantPast
     var isDragging = false
 
     private static var sessionRegistry: [WeakWindowSessionBox] = []
-    private static let mirrorHoverSuppressionInterval: TimeInterval = 0.42
     private static let siblingWindowTransitionGraceInterval: TimeInterval = 0.22
     private static let siblingWindowPostInteractionGraceInterval: TimeInterval = 1.5
     private static let managedEdgeDetachTolerance: CGFloat = 72
+    /// "几何已脱离边缘"判定的滞回确认时长：脱离状态需要连续保持至少这么久，
+    /// 才会真正触发 transitionToFloatingFromManagedState。低于该时长则视为
+    /// 第三方 App 内部的瞬时位移抖动，主动忽略。详见 edgeDetachCandidateSince。
+    private static let managedEdgeDetachConfirmInterval: TimeInterval = 0.25
     private static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
     private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
@@ -386,9 +667,7 @@ class WindowSession {
         pinControlWindow.onToggle = { [weak self] in
             self?.toggleTemporaryPin()
         }
-        mirrorOverlayWindow.onActivateRealWindow = { [weak self] in
-            self?.activateMirrorBackedWindow()
-        }
+        // 置顶面板自身鼠标事件穿透 (`ignoresMouseEvents = true`)，无需在此挂接交互回调。
         
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleAppActivated(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         
@@ -401,6 +680,11 @@ class WindowSession {
         // 核心修复：自动收编遗留在边缘的应用窗口
         checkAndAdoptEdgeState()
         Self.register(self)
+
+        // [Watchdog] 启动状态自愈定时器：唯一的两件事——
+        // 1. 把"应显未显"的快照条捞回来；2. 把卡死的 isAnimating 复位。
+        // 永远不主动改变 state / 几何 / 焦点，只做正向兜底。
+        startStateWatchdog()
     }
 
     var runtimeClaimSnapshot: SideBarBridge.RuntimeClaimSnapshot {
@@ -448,16 +732,55 @@ class WindowSession {
 
     @discardableResult
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool {
-        guard !isAnimating else { return false }
+        guard !isAnimating else {
+            // 动画过程中 frame 一定会临时偏离最终锚点，禁止任何脱离判定，
+            // 也清空候选时间戳，避免动画结束的瞬间被误判为"持续脱离"。
+            edgeDetachCandidateSince = nil
+            return false
+        }
         // 关键修复：临时置顶 / 镜像置顶期间，用户允许把窗口拖到屏幕任意位置；
         // 不能在置顶期间把这种位移当成"detach"，否则 state 会被错误降级为 .floating，
         // 取消置顶后即使窗口归位回边缘，自动折叠链路也已断开（`checkMouseForCollapse`
         // 的 `guard case .expanded = state` 会直接早退）。
-        guard !isTemporarilyPinned else { return false }
-        guard case .expanded = state else { return false }
-        guard let frame = getRawWindowFrame(), isDetachedFromManagedEdge(frame) else { return false }
-        transitionToFloatingFromManagedState()
-        return true
+        guard !isTemporarilyPinned else {
+            edgeDetachCandidateSince = nil
+            return false
+        }
+        guard case .expanded = state else {
+            edgeDetachCandidateSince = nil
+            return false
+        }
+        guard let frame = getRawWindowFrame(), isDetachedFromManagedEdge(frame) else {
+            // 已回到 / 仍贴在边缘 -> 清空候选时间戳，重新积累滞回窗口
+            edgeDetachCandidateSince = nil
+            return false
+        }
+
+        // 关键修复（"展开后偶发快照条消失 + 鼠标移出不自动折叠"Bug 治本方案）：
+        // 第三方 App 在 expanded 期间会因为内部布局重排（content 刷新、模态弹出、
+        // 焦点切换、显示器/Dock 配置变化等）短暂自行改写位置/宽度，导致 AX
+        // 上报的 minX/maxX 瞬时飘出 72px。如果直接单帧降级到 .floating，会一并
+        // orderOut 快照条、invalidate mouseTrackingTimer、unlock 屏幕锚点，
+        // 用户视觉上就是"快照条莫名其妙没了，鼠标移出窗口也不收回，必须重新
+        // 拖到边缘才行"，这正是反馈中"偶发"现象的根因。
+        //
+        // 滞回确认：脱离状态需要连续持续至少 managedEdgeDetachConfirmInterval
+        // 才真正降级。真正的用户拖拽脱边轻易超过该阈值，不受影响；而第三方
+        // 应用的瞬时位移抖动通常会在下一两个 AX 事件内自我纠正，从而被吸收。
+        let now = Date()
+        if let since = edgeDetachCandidateSince {
+            if now.timeIntervalSince(since) < Self.managedEdgeDetachConfirmInterval {
+                return false
+            }
+            // 持续脱离已确认，真实降级
+            edgeDetachCandidateSince = nil
+            transitionToFloatingFromManagedState()
+            return true
+        } else {
+            // 首次观察到脱离，进入候选期，本帧不降级
+            edgeDetachCandidateSince = now
+            return false
+        }
     }
 
     func relinquishManagedStateForBundleTransfer() {
@@ -1013,6 +1336,11 @@ class WindowSession {
         )
     }
 
+    func handleMouseDown() {
+        isDragging = false
+        edgeDetachCandidateSince = nil
+    }
+
     static func noteGlobalKeyDown(_ event: NSEvent) {
         let now = Date()
         lastGlobalKeyDownAt = now
@@ -1045,6 +1373,10 @@ class WindowSession {
             return .menuBar
         }
 
+        if isNotificationCenterClick(at: point, screenFrame: frame) {
+            return .notificationBanner
+        }
+
         guard let dockSide = AppConfig.shared.resolvedDockAvoidanceSide() else {
             return .content
         }
@@ -1055,6 +1387,32 @@ class WindowSession {
         }
 
         return .content
+    }
+
+    /// 通知横幅/通知中心点击判定：命中点位于屏幕右侧竖条区域，且该点最上层窗口属于
+    /// NotificationCenter 进程。归属校验避免"点击某 App 自家窗口右上角"被误判为通知点击。
+    /// 仅在命中右侧区域时才查询窗口列表，普通点击无额外开销。
+    private static func isNotificationCenterClick(at point: CGPoint, screenFrame: CGRect) -> Bool {
+        let stripWidth: CGFloat = 420
+        guard point.x >= screenFrame.maxX - stripWidth else { return false }
+
+        // CGWindowList 使用 Quartz 全局坐标（原点在主屏左上角），需转换 Y 轴
+        let quartzPoint = CGPoint(x: point.x, y: (NSScreen.screens.first?.frame.height ?? 1080) - point.y)
+        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
+        for info in infoList {
+            guard let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
+                  bounds.contains(quartzPoint) else { continue }
+            // 列表按 Z 序从前到后排列，第一个命中点的就是最上层窗口
+            if let ownerPID = info[kCGWindowOwnerPID as String] as? Int32 {
+                return NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier == "com.apple.notificationcenterui"
+            }
+            if let ownerName = info[kCGWindowOwnerName as String] as? String {
+                return ownerName == "Notification Center" || ownerName == "NotificationCenter"
+            }
+            return false
+        }
+        return false
     }
 
     private static func dockPreferenceValue(forKey key: String) -> Any? {
@@ -1165,18 +1523,19 @@ class WindowSession {
         if isTemporarilyPinned, app.processIdentifier != self.pid {
             if isMirrorPinActive {
                 if Self.shouldYieldPinnedWindow(to: app.processIdentifier, excluding: self) {
+                    // 让位（yield）给优先级更高的另一个置顶窗口：把面板从屏幕摘掉。
+                    // userInteraction 态下面板本就不在屏幕上，hideMirrorOverlay 幂等。
                     hideMirrorOverlay()
-                } else {
-                    if !mirrorOverlayWindow.hasSnapshot {
-                        _ = refreshMirrorOverlaySnapshot(presentImmediately: false)
+                } else if !isInUserInteractionMode, isMirrorOverlayVisible {
+                    // 其他 App 拿到前台且当前处于 sharing 态：把面板顶回最前。
+                    // userInteraction 态下面板已被摘掉、SCStream 已停，用户正在直接操作真实窗口，
+                    // 这里不动它——直到用户在源窗口外点击才会回到 sharing 态。
+                    mirrorOverlayWindow.alphaValue = 1
+                    if let rawFrame = getRawWindowFrame() {
+                        mirrorOverlayWindow.display(at: appKitFrame(fromCGFrame: rawFrame))
+                    } else {
+                        mirrorOverlayWindow.orderFrontRegardless()
                     }
-                    revealMirrorOverlay()
-                    setMirrorSourceWindowHidden(true)
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.isMirrorPinActive, self.isMirrorOverlayVisible else { return }
-                        _ = self.refreshMirrorOverlaySnapshot(presentImmediately: false)
-                    }
-                    startMirrorRefreshTimer()
                 }
                 return
             }
@@ -1198,15 +1557,29 @@ class WindowSession {
                 print("📱 忽略: 处于融合切换保护期")
                 return
             }
+            let isFocusedWindowSession = isCurrentFocusedWindowOfApp()
             if !Self.isAppActivationAllowed(for: self) {
-                print("📱 忽略: 这次激活被定向给同 App 的另一个窗口")
-                return
+                // 无定向路由时，多窗口唤回需要额外收窄：
+                // 通知点击放行代表窗口；菜单栏点击只放行当前真正获得焦点的窗口。
+                let activationTrigger = recentExplicitRevealTrigger()
+                    ?? Self.peekExplicitRevealIntent(for: self.pid)?.trigger
+                let isNotificationReveal = activationTrigger == .notificationClick
+                let isMenuBarReveal = activationTrigger == .menuBarClick
+                let allowsUntargetedReveal =
+                    (isNotificationReveal && Self.isPreferredNotificationRevealSession(self))
+                    || (isMenuBarReveal && isFocusedWindowSession)
+                guard Self.targetedActivationByPID[self.pid] == nil,
+                      allowsUntargetedReveal else {
+                    print("📱 忽略: 这次激活被定向给同 App 的另一个窗口")
+                    return
+                }
             }
             registerExplicitRevealIntentIfNeeded()
-            let isFocusedWindowSession = isCurrentFocusedWindowOfApp()
             if isMirrorPinActive {
-                hideMirrorOverlay()
-                print("🪞 镜像层已收起，切回真实窗口交互")
+                // 置顶面板就是源窗口的实时画面，源 App 拿到前台时不再隐藏面板，
+                // 避免与 handleAppActivated 的其它分支形成"先隐后显"的视觉抖动。
+                // 用户若需要解除置顶并直接操作真实窗口，请再次点击图钉按钮，
+                // 或鼠标 hover 进入面板覆盖区由两态机自动切到 userInteraction 态。
                 return
             }
             if isTemporarilyPinned {
@@ -1214,7 +1587,10 @@ class WindowSession {
                 return
             }
             if case .snapped = state {
-                guard isFocusedWindowSession else {
+                // 通知点击唤回以"主窗口路由"为准（门禁处已筛选），macOS 焦点落在哪个窗口不影响展开决策
+                let pendingTrigger = Self.peekExplicitRevealIntent(for: pid)?.trigger
+                let allowsUnfocusedReveal = pendingTrigger == .notificationClick
+                guard isFocusedWindowSession || allowsUnfocusedReveal else {
                     if isRecentExplicitFinderDesktopClick() {
                         print("📱 Finder 桌面真实点击，保留前台，不再主动释放焦点")
                         return
@@ -1229,7 +1605,8 @@ class WindowSession {
                         print("📱 显式唤回被同 App 的其他标准窗口接管，丢弃本窗口展开意图")
                         return
                     }
-                    if Self.peekExplicitRevealIntent(for: pid) != nil {
+                    if let pendingTrigger = Self.peekExplicitRevealIntent(for: pid)?.trigger,
+                       pendingTrigger != .menuBarClick {
                         scheduleDeferredExplicitRevealIfNeeded()
                     }
                     print("📱 忽略: 当前激活的是同 App 的其他窗口")
@@ -1253,7 +1630,13 @@ class WindowSession {
 
                 guard let revealIntent = Self.consumeExplicitRevealIntent(for: pid) else { return }
                 let interaction = interactionFlags(for: revealIntent.trigger)
-                let triggerLabel = revealIntent.trigger == .dockClick ? "Dock" : "App Switch"
+                let triggerLabel: String
+                switch revealIntent.trigger {
+                case .dockClick: triggerLabel = "Dock"
+                case .appSwitch: triggerLabel = "App Switch"
+                case .notificationClick: triggerLabel = "通知"
+                case .menuBarClick: triggerLabel = "菜单栏"
+                }
                 print("📱 \(triggerLabel) 展开: \(bundleID)")
                 hasReleasedDockClick = interaction.hasReleasedDockClick
                 expandWindow(isDockActivated: interaction.isDockActivated)
@@ -1394,6 +1777,7 @@ class WindowSession {
             // 并临时绕过 sibling grace 判定 2 秒。原因详见 siblingGraceBypassUntil 注释。
             self.lastSiblingWindowInteractionAt = nil
             self.outsideCollapseCandidateSince = nil
+            self.edgeDetachCandidateSince = nil
             self.siblingGraceBypassUntil = Date().addingTimeInterval(2.0)
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
@@ -1404,9 +1788,11 @@ class WindowSession {
     }
 
     private func engageMirrorPin(using frame: CGRect) {
+        // 屏幕录制权限：用户首次点击置顶图钉时按需请求；未授权直接退出，保留真实窗口本来的展开态。
         guard ScreenCaptureAccessManager.shared.hasAccess() || ScreenCaptureAccessManager.shared.requestAccess() else {
             return
         }
+        guard #available(macOS 12.3, *) else { return }
 
         pinnedAnchor = PinnedAnchor(expandedMidY: frame.midY)
         isTemporarilyPinned = true
@@ -1415,13 +1801,14 @@ class WindowSession {
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         startMouseTrackingTimer()
         showIndicator(animated: false)
-        showMirrorOverlay(hideRealWindowAfterPresenting: true)
+        startMirrorCapture(initialFrame: frame)
         updatePinControlWindow()
     }
 
     private func releaseMirrorPin() {
-        stopMirrorRefreshTimer()
+        stopMirrorGeometryTimer()
         hideMirrorOverlay()
+        teardownMirrorCapture()
         isMirrorPinActive = false
 
         guard let rawFrame = getRawWindowFrame() else {
@@ -1456,10 +1843,11 @@ class WindowSession {
             self.forceWindowGeometry(x: targetFrame.minX, y: targetFrame.minY, height: targetFrame.height)
             self.isAnimating = false
             self.pinnedAnchor = nil
-            // 关键修复：取消镜像置顶并归位后，清空 sibling 防误触相关的所有状态，
+            // 关键修复：取消置顶并归位后，清空 sibling 防误触相关的所有状态，
             // 并临时绕过 sibling grace 判定 2 秒。原因详见 siblingGraceBypassUntil 注释。
             self.lastSiblingWindowInteractionAt = nil
             self.outsideCollapseCandidateSince = nil
+            self.edgeDetachCandidateSince = nil
             self.siblingGraceBypassUntil = Date().addingTimeInterval(2.0)
             self.showIndicator(animated: false)
             self.startMouseTrackingTimer()
@@ -1519,102 +1907,410 @@ class WindowSession {
         pinnedRaiseRemainingPulses = 0
     }
 
-    private func showMirrorOverlay(hideRealWindowAfterPresenting: Bool = false) {
-        guard isMirrorPinActive else { return }
-        if !mirrorOverlayWindow.hasSnapshot {
-            guard refreshMirrorOverlaySnapshot(presentImmediately: false) else { return }
-        }
-        revealMirrorOverlay()
-        if hideRealWindowAfterPresenting {
-            setMirrorSourceWindowHidden(true)
-        }
-        startMirrorRefreshTimer()
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isMirrorPinActive, self.isMirrorOverlayVisible else { return }
-            _ = self.refreshMirrorOverlaySnapshot(presentImmediately: false)
-        }
-    }
+    /// 启动一次完整的置顶画面采集：
+    /// - 立刻把空面板按源窗口当前 frame 显示出来，避免 SCStream 首帧到达前出现位置漂移；
+    /// - 解析 `CGWindowID -> SCWindow/SCDisplay` 后再异步发起 `SCStream.startCapture`，
+    ///   解析失败或采集器自报错时进入恢复流程，仍失败再退出置顶态。
+    private func startMirrorCapture(initialFrame: CGRect) {
+        guard #available(macOS 12.3, *) else { return }
 
-    private func revealMirrorOverlay() {
         isMirrorOverlayVisible = true
-        mirrorOverlayWindow.ignoresMouseEvents = false
-        mirrorOverlayWindow.alphaValue = 1
-        mirrorOverlayWindow.present()
-    }
+        isInUserInteractionMode = false
+        let initialAppKitFrame = appKitFrame(fromCGFrame: initialFrame)
+        mirrorOverlayWindow.display(at: initialAppKitFrame)
+        // 立即写入 hit-test 缓存，让 hover tracking 启动后第一次评估也能拿到有效几何，
+        // 避免 0.18s 内事件全部因为缓存为空而被丢弃。
+        cachedSourceHitFrame = initialAppKitFrame
+        mirrorGeometryMissSince = nil
 
-    private func hideMirrorOverlay() {
-        isMirrorOverlayVisible = false
-        stopMirrorRefreshTimer()
-        mirrorOverlayWindow.ignoresMouseEvents = false
-        mirrorOverlayWindow.hide()
-        setMirrorSourceWindowHidden(false)
-    }
+        lastMirrorAppliedPointSize = CGSize(width: initialFrame.width, height: initialFrame.height)
 
-    private func startMirrorRefreshTimer() {
-        stopMirrorRefreshTimer()
-        mirrorRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: true) { [weak self] _ in
-            guard let self, self.isMirrorPinActive else { return }
-            _ = self.refreshMirrorOverlaySnapshot(presentImmediately: false)
+        guard attachMirrorCapturer() else {
+            isMirrorPinActive = false
+            isMirrorOverlayVisible = false
+            mirrorOverlayWindow.hide()
+            return
         }
+
+        startMirrorGeometryTimer()
+        startMirrorOverlayHoverTracking()
     }
 
-    private func stopMirrorRefreshTimer() {
-        mirrorRefreshTimer?.invalidate()
-        mirrorRefreshTimer = nil
-    }
-
+    /// 创建一个新的 `WindowMirrorLiveCapturer`、挂到面板上、并异步发起 `SCStream.startCapture`。
+    /// 成功返回 true；解析源窗口 ID 失败返回 false（调用方负责状态归位）。
+    /// 启动后 SCStream 异常停止由 `handleMirrorCaptureFailure` 兜底，不在这里关心。
     @discardableResult
-    private func refreshMirrorOverlaySnapshot(presentImmediately: Bool = true) -> Bool {
-        guard isMirrorPinActive,
-              let rawFrame = getRawWindowFrame(),
-              let windowID = WindowAlphaManager.shared.findWindowID(for: self.windowElement, pid: self.pid),
-              let snapshot = WindowMirrorSnapshotter.shared.snapshot(windowID: windowID, bounds: rawFrame)
-        else {
+    private func attachMirrorCapturer() -> Bool {
+        guard #available(macOS 12.3, *) else { return false }
+        guard let sourceWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) else {
+            print("🪟 置顶启动失败：无法解析源窗口 ID")
             return false
         }
 
-        let appKitFrame = CGRect(
-            x: snapshot.captureBounds.minX,
-            y: primaryScreenHeight - snapshot.captureBounds.minY - snapshot.captureBounds.height,
-            width: snapshot.captureBounds.width,
-            height: snapshot.captureBounds.height
-        )
-        mirrorOverlayWindow.update(frame: appKitFrame, image: snapshot.image, showImmediately: presentImmediately)
+        let capturer = WindowMirrorLiveCapturer()
+        capturer.onCaptureFailure = { [weak self] in
+            guard let self, self.isMirrorPinActive else { return }
+            self.handleMirrorCaptureFailure()
+        }
+        mirrorLiveCapturer = capturer
+        mirrorOverlayWindow.attachCaptureLayer(capturer.renderingLayer)
+
+        let preferredScreen = detectScreen()
+        lastMirrorScreen = preferredScreen
+        let backingScale = preferredScreen.backingScaleFactor
+        let pointSize = lastMirrorAppliedPointSize
+
+        // ⚠️ resolver 必须 weak capture capturer：在解析回调返回前，hover 引导（或 destroy）
+        // 完全可能已经把 `mirrorLiveCapturer` 置为 nil（进入 userInteraction 态会同步 stop+清引用）。
+        // 如果这里 strong capture capturer，闭包会让那只"已经被换掉"的 capturer 起死回生并启动
+        // 一条无人能再 stop 的 SCStream（SCStream 与 capturer 通过 addStreamOutput 形成强引循环，
+        // 整个回路不再有人持有 capturer 时也无法被回收）—— 这就是"光标已在源窗口区域时点钉
+        // 立刻泄漏一条永驻 SCStream"的根因。
+        //
+        // 修复：weak capture，并在回调里只服务"我仍然是当前挂载者，且不在 userInteraction 态"
+        // 这一个最新版本。其它情况一律放过，让该 capturer 自然释放。
+        WindowMirrorSourceResolver.shared.resolve(windowID: sourceWindowID,
+                                                  preferredScreen: preferredScreen) { [weak self, weak capturer] resolved in
+            guard let self, let capturer,
+                  self.isMirrorPinActive,
+                  self.mirrorLiveCapturer === capturer,
+                  !self.isInUserInteractionMode else { return }
+            guard let resolved else {
+                print("🪟 置顶启动失败：未在 ScreenCaptureKit 中找到匹配窗口 (\(sourceWindowID))")
+                self.releaseMirrorPin()
+                return
+            }
+            capturer.start(window: resolved.window,
+                           on: resolved.display,
+                           nominalPointSize: pointSize,
+                           backingScale: backingScale)
+        }
         return true
     }
 
-    private func activateMirrorBackedWindow() {
+    /// SCStream 报错（多见于源窗口被外部强制 resize、空间切换、瞬时配置冲突等）时的兜底：
+    /// - 1.5s 内已经尝试过一次自动重启 → 判定为不可恢复，退出置顶态归位；
+    /// - 否则摘掉旧 capturer，刷新 resolver 缓存，延迟 0.2s 后用 `attachMirrorCapturer` 重启一次。
+    ///
+    /// 之所以"重启而不直接归位"，是为了避免之前观察到的一类问题：用户拖动 resize 句柄期间
+    /// SCStream 偶发报错就把整个置顶态拆掉，肉眼上看到的就是"调整窗口大小后共享立刻断掉"。
+    private func handleMirrorCaptureFailure() {
+        guard #available(macOS 12.3, *) else {
+            releaseMirrorPin()
+            return
+        }
+        let now = Date()
+        if now.timeIntervalSince(lastMirrorCaptureRestartAt) < 1.5 {
+            print("🪟 置顶采集短时间内重复失败，回到普通态")
+            releaseMirrorPin()
+            return
+        }
+        lastMirrorCaptureRestartAt = now
+        guard let rawFrame = getRawWindowFrame() else {
+            releaseMirrorPin()
+            return
+        }
+        print("🪟 置顶采集异常，自动重启")
+        mirrorLiveCapturer?.stop()
+        mirrorLiveCapturer = nil
+        mirrorOverlayWindow.detachCaptureLayer()
+        lastMirrorAppliedPointSize = CGSize(width: rawFrame.width, height: rawFrame.height)
+        WindowMirrorSourceResolver.shared.invalidateCache()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, self.isMirrorPinActive else { return }
+            if !self.attachMirrorCapturer() {
+                self.releaseMirrorPin()
+            }
+        }
+    }
+
+    /// 收尾实时采集：停 stream、摘 layer、清缓存。仅清理，不动状态机标志位本身。
+    private func teardownMirrorCapture() {
+        pendingMirrorOutputUpdate?.cancel()
+        pendingMirrorOutputUpdate = nil
+        isInUserInteractionMode = false
+        stopMirrorOverlayHoverTracking()
+        stopMirrorGeometryTimer()
+        mirrorLiveCapturer?.stop()
+        mirrorLiveCapturer = nil
+        mirrorOverlayWindow.detachCaptureLayer()
+        mirrorOverlayWindow.hide()
+        isMirrorOverlayVisible = false
+        lastMirrorAppliedPointSize = .zero
+        lastMirrorScreen = nil
+        lastMirrorCaptureRestartAt = .distantPast
+        cachedSourceHitFrame = nil
+        mirrorGeometryMissSince = nil
+    }
+
+    /// 装上 sharing ↔ userInteraction 两态机的鼠标事件探测器。
+    /// 置顶面板自身鼠标穿透，无法用 NSTrackingArea 直接探测，这里用两个事件监听器组合捕捉：
+    /// - 全局 monitor 抓鼠标处在其它 App 窗口上时的事件；
+    /// - 本地 monitor 抓鼠标处在本 App 自己的窗口（例如图钉按钮）上时的事件。
+    ///
+    /// 关键语义：
+    /// - 鼠标 hover **进入**源窗口覆盖区 → 立刻进入 userInteraction 态：**完全停止 SCStream**，
+    ///   面板从屏幕摘掉。真实窗口此刻就是一个普通聚焦窗口，用户怎么拖、怎么 resize、
+    ///   怎么右键菜单都不会出问题——因为根本没有 SCStream 在跑。
+    /// - 鼠标 **点击** 源窗口覆盖区**之外** → 进入 sharing 态：按真实窗口当时最新的
+    ///   几何（resize 之后的新尺寸）重启 SCStream，挂回面板。短暂黑屏即可换上新画面。
+    /// - 鼠标移到源窗口区外但**没点击**：不重启共享，保持 userInteraction 态。
+    ///   避免用户视线扫到旁边内容、鼠标飘出去又飘回来时反复 stop/start SCStream。
+    private func startMirrorOverlayHoverTracking() {
+        stopMirrorOverlayHoverTracking()
+        let interestingTypes: NSEvent.EventTypeMask = [
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+            .leftMouseDown, .rightMouseDown, .otherMouseDown
+        ]
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: interestingTypes, handler: { [weak self] event in
+            self?.handleMirrorPointerEvent(eventType: event.type)
+        }) {
+            mirrorOverlayMouseMonitors.append(global)
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: interestingTypes, handler: { [weak self] event in
+            self?.handleMirrorPointerEvent(eventType: event.type)
+            return event
+        }) {
+            mirrorOverlayMouseMonitors.append(local)
+        }
+        // 评估一次初始状态：若启动时鼠标已经压在源窗口上，应当进入 userInteraction 态。
+        // 关键：必须延后到下一个 runloop tick——否则会同步早于 resolver 回调一步发出 stop()，
+        // 把 mirrorLiveCapturer 置为 nil；resolver 仍带着旧 capturer 起死回生启动 SCStream，
+        // 形成永远停不下来的孤儿流（见 attachMirrorCapturer 的 weak capturer 修复）。
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isMirrorPinActive else { return }
+            self.handleMirrorPointerEvent(eventType: .mouseMoved)
+        }
+    }
+
+    private func stopMirrorOverlayHoverTracking() {
+        for monitor in mirrorOverlayMouseMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        mirrorOverlayMouseMonitors.removeAll()
+    }
+
+    /// 鼠标事件分发：根据当前鼠标位置与事件类型在 sharing/userInteraction 之间切换。
+    /// 见 `startMirrorOverlayHoverTracking` 的注释了解状态机语义。
+    private func handleMirrorPointerEvent(eventType: NSEvent.EventType) {
         guard isMirrorPinActive else { return }
-        let suppression = Self.mirrorHoverSuppressionInterval
-        Self.suppressOtherMirrorHoverActivation(excluding: self, for: suppression)
-        suspendMirrorHoverActivation(for: suppression)
-        setMirrorSourceWindowHidden(false)
-        if let runningApp = NSRunningApplication(processIdentifier: pid) {
+
+        // hit-test 完全走缓存：源窗口几何由 `syncMirrorGeometryWithSourceWindow` (0.18s)
+        // 维护，事件路径上不再触发任何跨进程 AX 调用，避免 60–120Hz × 2 次 AX IPC 拖垮主线程。
+        guard let hitFrame = cachedSourceHitFrame else { return }
+        let pointer = NSEvent.mouseLocation
+        let isInside = hitFrame.contains(pointer)
+
+        let isMouseDown: Bool
+        switch eventType {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            isMouseDown = true
+        default:
+            isMouseDown = false
+        }
+        // 当前是否有任意鼠标键已经被按下。用于过滤"外部 drag 越过置顶区"——例如用户
+        // 从 Finder 拖文件、从 Safari 拖图、从其它 App 拖窗口标题栏，鼠标路径若恰好穿过
+        // 置顶区域，绝不能视为"进入交互"。否则会被强制 raise 源 App，drop 目标被遮挡或失焦。
+        let isAnyMouseButtonPressed = NSEvent.pressedMouseButtons != 0
+
+        if isInside {
+            if isMouseDown {
+                // 真正的"点击落到源窗口覆盖区里"：这是用户明确意图，
+                // 停 SCStream + 摘面板 + raise 源 App，让点击落到真实窗口。
+                if !isInUserInteractionMode {
+                    enterUserInteractionMode(promoteSourceWindow: true)
+                } else {
+                    // 已在 userInteraction 态：仍把源 App 抬一下，防止用户连击中途焦点被旁路抢走。
+                    promoteSourceWindowBeneathMirrorOverlay()
+                }
+            } else if !isAnyMouseButtonPressed {
+                // 纯 hover：没有任何按键被按下。停流 + 摘面板 + 把源窗口提到最前。
+                // 用户主动把窗口置顶就是要看它——面板消失后看到的就必须是源窗口，
+                // 而不是面板背后其他 App 的窗口。误扫抢焦的代价远小于"移过去啥都看不见"。
+                if !isInUserInteractionMode {
+                    enterUserInteractionMode(promoteSourceWindow: true)
+                }
+            }
+            // else: 鼠标键已按下但不是本次事件触发的 mouseDown —— 这是外部 drag，
+            // 让事件穿透，不切换状态。
+        } else {
+            // 鼠标在源窗口覆盖区**之外**：仅在点击事件上才重启共享，单纯移动到外部不切换，
+            // 避免来回飘移触发反复 stop/start。
+            if isInUserInteractionMode, isMouseDown {
+                resumeMirrorCaptureMode()
+            }
+        }
+    }
+
+    /// 进入用户交互态：彻底停止 SCStream，让真实窗口表现得就像一个普通聚焦窗口。
+    /// 调用时机由 hover 或源窗口区域内的 mouseDown 触发；调用后 `isMirrorPinActive` 仍为
+    /// true（图钉按钮保持置顶图标），但 `isMirrorOverlayVisible` 与 capturer 都被收起，
+    /// 下次 mouseDown 落在源窗口区域外部时由 `resumeMirrorCaptureMode` 重新创建一份。
+    ///
+    /// - Parameter promoteSourceWindow: 是否把源 App 抬到最前（拿焦点）。
+    ///   当前所有进入 userInteraction 的路径（hover 或 mouseDown）都传 `true`：
+    ///   面板消失后用户看到的必须就是源窗口，而不是面板背后的其他 App。
+    private func enterUserInteractionMode(promoteSourceWindow: Bool) {
+        guard isMirrorPinActive, !isInUserInteractionMode else { return }
+        isInUserInteractionMode = true
+        // userInteraction 态下面板已从屏幕摘掉、SCStream 也停了，几何 timer 继续以 0.18s
+        // 跑 AX + detect screen 没有任何意义；更危险的是它会在 syncMirrorGeometryWithSourceWindow
+        // 单次 nil 时立刻拆置顶（resize 中途、Space 切换瞬时 miss 都会被误判为窗口消失）。
+        // 这里直接停掉，等 resume 时再起。
+        stopMirrorGeometryTimer()
+        pendingMirrorOutputUpdate?.cancel()
+        pendingMirrorOutputUpdate = nil
+        if promoteSourceWindow {
+            // 仅在 mouseDown 命中源窗口区域时抢焦：在 SCStream 停止瞬间面板会从屏幕上消失，
+            // 提前 promote 一次保证那一刻用户看到的是真实窗口而不是它后面的应用。
+            promoteSourceWindowBeneathMirrorOverlay()
+        }
+        mirrorLiveCapturer?.stop()
+        mirrorLiveCapturer = nil
+        mirrorOverlayWindow.detachCaptureLayer()
+        mirrorOverlayWindow.hide()
+        isMirrorOverlayVisible = false
+    }
+
+    /// 退出用户交互态：按真实窗口当时的最新几何重启 SCStream，再次置顶。
+    /// 因为 SCStream 是全新启动的，画面尺寸天然匹配新窗口（用户刚才如果改过 resize，
+    /// 这里看到的就是 resize 之后的样子），不会再出现"新窗口 + 旧尺寸共享副本"的双窗口诡异感。
+    private func resumeMirrorCaptureMode() {
+        guard isMirrorPinActive, isInUserInteractionMode else { return }
+        guard #available(macOS 12.3, *) else {
+            releaseMirrorPin()
+            return
+        }
+        guard let rawFrame = getRawWindowFrame() else {
+            releaseMirrorPin()
+            return
+        }
+
+        isInUserInteractionMode = false
+        isMirrorOverlayVisible = true
+        let appKit = appKitFrame(fromCGFrame: rawFrame)
+        mirrorOverlayWindow.display(at: appKit)
+        cachedSourceHitFrame = appKit
+        mirrorGeometryMissSince = nil
+        lastMirrorAppliedPointSize = CGSize(width: rawFrame.width, height: rawFrame.height)
+        // 正常 resume 路径不强制 invalidateCache：源窗口的 windowID 在其生命周期里稳定，
+        // 反复 hover-in/click-out 都丢 SCShareableContent 缓存只会引发 >100ms 的全量枚举。
+        // 缓存失效只在 attach 真的失败（窗口消失 / 流挂掉）时由 handleMirrorCaptureFailure 触发。
+        if !attachMirrorCapturer() {
+            releaseMirrorPin()
+            return
+        }
+        startMirrorGeometryTimer()
+    }
+
+    /// 把源 App 与源窗口抬到最前。userInteraction 态下面板已从屏幕摘掉，
+    /// 此处把真实窗口提到前台，用户就能看到、点击、拖动、resize 它。
+    private func promoteSourceWindowBeneathMirrorOverlay() {
+        if let runningApp = NSRunningApplication(processIdentifier: pid), !runningApp.isActive {
             runningApp.activate(options: .activateIgnoringOtherApps)
         }
-        axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true, context: "WindowSession.activateMirrorBackedWindow.main")
-        axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true, context: "WindowSession.activateMirrorBackedWindow.focused")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            guard let self else { return }
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.08
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                self.mirrorOverlayWindow.animator().alphaValue = 0
-            }, completionHandler: {
-                self.hideMirrorOverlay()
-            })
+        // 显式把目标窗口提为 main + focused，避免 App 内有多个窗口时被系统挑到另一个。
+        axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true,
+                           context: "WindowSession.promoteSourceWindowBeneathMirrorOverlay.main")
+        axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true,
+                           context: "WindowSession.promoteSourceWindowBeneathMirrorOverlay.focused")
+        // 显式 raise：保险起见把窗口在 AX 层面也提到本 App 最前。
+        AXUIElementPerformAction(windowElement, kAXRaiseAction as CFString)
+    }
+
+    /// 仅把面板从屏幕收起（用于 yield 给具备置顶权重更高的窗口时的临时让位）。
+    /// 注意：sharing 态下采集仍在跑，仅 z-order 摘掉；userInteraction 态下面板本就不在屏幕上，
+    /// 这里仅做幂等收尾。
+    private func hideMirrorOverlay() {
+        isMirrorOverlayVisible = false
+        mirrorOverlayWindow.hide()
+    }
+
+    /// 跟踪源窗口几何（位置/尺寸/所在屏）的轻量定时器。
+    /// 这里只搬面板、按需 update 采集尺寸；画面内容由 SCStream 异步推流，无需我们触发刷新。
+    private func startMirrorGeometryTimer() {
+        stopMirrorGeometryTimer()
+        mirrorGeometryTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: true) { [weak self] _ in
+            self?.syncMirrorGeometryWithSourceWindow()
         }
     }
 
-    private func suspendMirrorHoverActivation(for duration: TimeInterval) {
-        mirrorOverlayWindow.suspendHoverActivation(for: duration)
+    private func stopMirrorGeometryTimer() {
+        mirrorGeometryTimer?.invalidate()
+        mirrorGeometryTimer = nil
     }
 
-    private func setMirrorSourceWindowHidden(_ hidden: Bool) {
-        guard mirrorHidesRealWindow != hidden else { return }
-        guard let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) else { return }
-        WindowAlphaManager.shared.setAlpha(for: windowID, alpha: hidden ? 0.0 : 1.0)
-        mirrorHidesRealWindow = hidden
+    private func syncMirrorGeometryWithSourceWindow() {
+        guard isMirrorPinActive else { return }
+        guard let rawFrame = getRawWindowFrame() else {
+            // 偶发 nil 不立刻拆置顶：用户拖动 resize 句柄过快、刚切 Space、AX 瞬时返回 nil
+            // 等场景都会触发单次 miss——直接 releaseMirrorPin 就是用户原始抱怨"调整窗口
+            // 大小过快立刻失去置顶"的同款症状。这里加滞回：累计 ≥ mirrorGeometryMissTolerance
+            // 才判定为"源窗口真的没了"。
+            let now = Date()
+            if let since = mirrorGeometryMissSince {
+                if now.timeIntervalSince(since) >= Self.mirrorGeometryMissTolerance {
+                    releaseMirrorPin()
+                }
+            } else {
+                mirrorGeometryMissSince = now
+            }
+            return
+        }
+        mirrorGeometryMissSince = nil
+        let mirrorAppKitFrame = appKitFrame(fromCGFrame: rawFrame)
+        // 缓存供 handleMirrorPointerEvent 做几乎免费的几何 contains 判定，
+        // 让事件路径上不再触发任何跨进程 AX。
+        cachedSourceHitFrame = mirrorAppKitFrame
+        if isMirrorOverlayVisible {
+            mirrorOverlayWindow.update(frame: mirrorAppKitFrame)
+        }
+        let currentScreen = detectScreen()
+        let pointSize = CGSize(width: rawFrame.width, height: rawFrame.height)
+        let backingScale = currentScreen.backingScaleFactor
+        let referenceScale = lastMirrorScreen?.backingScaleFactor ?? backingScale
+        let sizeDelta = abs(pointSize.width - lastMirrorAppliedPointSize.width) > 0.5
+            || abs(pointSize.height - lastMirrorAppliedPointSize.height) > 0.5
+        let scaleDelta = abs(backingScale - referenceScale) > 0.01
+
+        guard sizeDelta || scaleDelta else { return }
+
+        // ⚠️ 防抖：用户拖动 resize 句柄期间，源窗口尺寸每 0.18s 都会发生变化。
+        // 直接每次都调 `SCStream.updateConfiguration`（或 macOS 13 之前的整体重启）
+        // 极易触发底层报错 → `didStopWithError` → `onCaptureFailure`，肉眼看到的
+        // 就是"调整窗口大小后共享立刻断掉"。
+        //
+        // 这里只在尺寸稳定 ≥ 0.35s 之后才把新尺寸推给采集器；resize 进行中：
+        // - 面板 frame 继续每 0.18s 跟随真实窗口（视觉无延迟）；
+        // - 画面层依赖 `SCStreamConfiguration.scalesToFit` + `AVSampleBufferDisplayLayer.videoGravity = .resizeAspect`
+        //   动态拉伸到新面板大小，期间略糊但不会断流；
+        // - 用户停手后才把高清分辨率一次性下发，避免高频热更新。
+        pendingMirrorOutputUpdate?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.isMirrorPinActive,
+                  let capturer = self.mirrorLiveCapturer,
+                  let liveFrame = self.getRawWindowFrame() else { return }
+            let liveScreen = self.detectScreen()
+            let livePointSize = CGSize(width: liveFrame.width, height: liveFrame.height)
+            capturer.updateOutputDimensions(pointSize: livePointSize,
+                                            backingScale: liveScreen.backingScaleFactor)
+            self.lastMirrorAppliedPointSize = livePointSize
+            self.lastMirrorScreen = liveScreen
+            self.pendingMirrorOutputUpdate = nil
+        }
+        pendingMirrorOutputUpdate = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    /// 把 CG 坐标系下的源窗口 frame 翻译成 AppKit 坐标系下的面板 frame。
+    /// 主屏左下角是 AppKit 原点；这一步必须使用主屏高度作为基准，否则跨屏会偏移整屏高度。
+    private func appKitFrame(fromCGFrame frame: CGRect) -> CGRect {
+        CGRect(
+            x: frame.minX,
+            y: primaryScreenHeight - frame.minY - frame.height,
+            width: frame.width,
+            height: frame.height
+        )
     }
 
     private func pinnedExpandedTargetFrame(from currentFrame: CGRect) -> CGRect? {
@@ -1706,9 +2402,16 @@ class WindowSession {
     private func recentExplicitRevealTrigger() -> ExplicitRevealTrigger? {
         if let sample = Self.lastGlobalMouseDownSample,
            Date().timeIntervalSince(sample.at) <= Self.explicitRevealIntentWindow,
-           sample.region == .dock,
            sample.at >= Self.lastGlobalKeyDownAt {
-            return .dockClick
+            if sample.region == .dock {
+                return .dockClick
+            }
+            if sample.region == .notificationBanner {
+                return .notificationClick
+            }
+            if sample.region == .menuBar {
+                return .menuBarClick
+            }
         }
         if Date().timeIntervalSince(Self.lastAppSwitchIntentAt) <= Self.explicitRevealIntentWindow {
             return .appSwitch
@@ -1726,7 +2429,9 @@ class WindowSession {
         switch trigger {
         case .dockClick:
             return (true, false)
-        case .appSwitch:
+        case .menuBarClick:
+            return (true, false)
+        case .appSwitch, .notificationClick:
             return (true, true)
         }
     }
@@ -1762,12 +2467,22 @@ class WindowSession {
 
         if bundleID == "com.apple.finder" {
             registerExplicitRevealIntentIfNeeded()
+        } else if let trigger = recentExplicitRevealTrigger(),
+                  trigger == .notificationClick || trigger == .menuBarClick {
+            // 通知 / 菜单栏点击时 App 可能已在前台（不触发 didActivate），在此补注册唤回意图
+            registerExplicitRevealIntentIfNeeded()
         }
 
         guard let pendingRevealIntent = Self.peekExplicitRevealIntent(for: pid) else {
             if bundleID == "com.apple.finder" {
                 print("📱 Finder 焦点回到隐藏窗口，但缺少显式唤回意图，忽略自动展开")
             }
+            return
+        }
+
+        // 通知点击唤回只放行"主窗口" session，其余窗口即使获得焦点也不展开
+        if pendingRevealIntent.trigger == .notificationClick,
+           !Self.isPreferredNotificationRevealSession(self) {
             return
         }
 
@@ -1949,12 +2664,10 @@ class WindowSession {
     private func pinControlFrames(for rawFrame: CGRect) -> (buttonFrame: CGRect, hiddenFrame: CGRect, triggerRect: CGRect, safeRect: CGRect)? {
         guard currentEdge == 1 || currentEdge == 2 else { return nil }
 
-        let appKitFrame = CGRect(
-            x: rawFrame.minX,
-            y: primaryScreenHeight - rawFrame.minY - rawFrame.height,
-            width: rawFrame.width,
-            height: rawFrame.height
-        )
+        // 统一走 appKitFrame(fromCGFrame:) helper，避免与镜像路径维护两份手写公式；
+        // 一旦跨屏修复或夹紧逻辑更新只需改 helper 一处。
+        // 注意：局部变量名避免与方法 `appKitFrame(fromCGFrame:)` 同名造成 shadow。
+        let appKitWindowFrame = appKitFrame(fromCGFrame: rawFrame)
         let screenFrame = getScreenForWindow().frame
         let buttonSize: CGFloat = 38
         let sideGap: CGFloat = 14
@@ -1962,8 +2675,8 @@ class WindowSession {
         let minEdgePadding: CGFloat = 8
 
         let preferredSide: SnapEdge = currentEdge == 1 ? .right : .left
-        let leftFits = appKitFrame.minX - sideGap - buttonSize >= screenFrame.minX + minEdgePadding
-        let rightFits = appKitFrame.maxX + sideGap + buttonSize <= screenFrame.maxX - minEdgePadding
+        let leftFits = appKitWindowFrame.minX - sideGap - buttonSize >= screenFrame.minX + minEdgePadding
+        let rightFits = appKitWindowFrame.maxX + sideGap + buttonSize <= screenFrame.maxX - minEdgePadding
 
         let buttonSide: SnapEdge
         switch preferredSide {
@@ -1978,32 +2691,32 @@ class WindowSession {
         let corridorRect: CGRect
         let triggerRect: CGRect
         if buttonSide == .right {
-            proposedX = appKitFrame.maxX + sideGap
-            hiddenX = appKitFrame.maxX - buttonSize * 0.58
+            proposedX = appKitWindowFrame.maxX + sideGap
+            hiddenX = appKitWindowFrame.maxX - buttonSize * 0.58
             corridorRect = CGRect(
-                x: appKitFrame.maxX - 2,
-                y: appKitFrame.maxY - buttonSize - verticalInset - 8,
+                x: appKitWindowFrame.maxX - 2,
+                y: appKitWindowFrame.maxY - buttonSize - verticalInset - 8,
                 width: sideGap + buttonSize + 4,
                 height: buttonSize + 20
             )
             triggerRect = CGRect(
-                x: appKitFrame.maxX - 72,
-                y: appKitFrame.maxY - 56,
+                x: appKitWindowFrame.maxX - 72,
+                y: appKitWindowFrame.maxY - 56,
                 width: 110,
                 height: 64
             )
         } else {
-            proposedX = appKitFrame.minX - buttonSize - sideGap
-            hiddenX = appKitFrame.minX - buttonSize * 0.42
+            proposedX = appKitWindowFrame.minX - buttonSize - sideGap
+            hiddenX = appKitWindowFrame.minX - buttonSize * 0.42
             corridorRect = CGRect(
-                x: appKitFrame.minX - buttonSize - sideGap - 2,
-                y: appKitFrame.maxY - buttonSize - verticalInset - 8,
+                x: appKitWindowFrame.minX - buttonSize - sideGap - 2,
+                y: appKitWindowFrame.maxY - buttonSize - verticalInset - 8,
                 width: sideGap + buttonSize + 4,
                 height: buttonSize + 20
             )
             triggerRect = CGRect(
-                x: appKitFrame.minX - 38,
-                y: appKitFrame.maxY - 56,
+                x: appKitWindowFrame.minX - 38,
+                y: appKitWindowFrame.maxY - 56,
                 width: 110,
                 height: 64
             )
@@ -2015,7 +2728,7 @@ class WindowSession {
         )
         let clampedY = Swift.max(
             screenFrame.minY + minEdgePadding,
-            Swift.min(appKitFrame.maxY - buttonSize - verticalInset, screenFrame.maxY - buttonSize - minEdgePadding)
+            Swift.min(appKitWindowFrame.maxY - buttonSize - verticalInset, screenFrame.maxY - buttonSize - minEdgePadding)
         )
 
         let buttonFrame = CGRect(x: clampedX, y: clampedY, width: buttonSize, height: buttonSize)
@@ -2199,6 +2912,25 @@ class WindowSession {
         return false
     }
 
+    private func caseSnapped() -> Bool {
+        if case .snapped = state { return true }
+        return false
+    }
+
+    private func isMainWindowOfApp() -> Bool {
+        var mainValue: CFTypeRef?
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: appElement,
+            attribute: kAXMainWindowAttribute as CFString,
+            value: &mainValue,
+            context: "WindowSession.isMainWindowOfApp.mainWindow"
+        ) == .success,
+              let mainWindowRef = mainValue else {
+            return false
+        }
+        return CFEqual(unsafeBitCast(mainWindowRef, to: AXUIElement.self), windowElement)
+    }
+
     private func suppressActivationNotifications(for duration: TimeInterval) {
         activationSuppressionUntil = Date().addingTimeInterval(duration)
     }
@@ -2315,12 +3047,9 @@ class WindowSession {
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         isTemporarilyPinned = false
         isMirrorPinActive = false
-        isMirrorOverlayVisible = false
         pinnedAnchor = nil
         stopPinnedRaisePulse()
-        stopMirrorRefreshTimer()
-        mirrorOverlayWindow.hide()
-        setMirrorSourceWindowHidden(false)
+        teardownMirrorCapture()
         let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
         setWindowAlpha(1.0, isHidden: false, frameHint: currentFrame, preserveRecoveryRecord: true)
         
@@ -2348,21 +3077,115 @@ class WindowSession {
     }
     
     private func destroy() {
+        // 防御性主线程化：destroy 链路涉及 AppKit/UI 操作，且必须在 AXObserver 注册时所在的
+        // 主 run loop 上拆除 run loop source。如果当前不在主线程（例如某条 dispatch.global 上
+        // 的最后一个强引用被释放从而触发 deinit），就把整个 destroy 重新调度到主线程，
+        // 避免在错误的 run loop 上调用 CFRunLoopRemoveSource 造成 source 残留 + use-after-free。
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.destroy() }
+            return
+        }
         Self.unregister(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         if let source = observerRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
             observerRunLoopSource = nil
         }
         mouseTrackingTimer?.invalidate()
         hoverDelayTimer?.invalidate()
         hoverInterruptTimer?.invalidate()
         pinnedRaiseTimer?.invalidate()
-        mirrorRefreshTimer?.invalidate()
+        // 置顶相关资源统一交给 teardownMirrorCapture：它会停 SCStream、摘 layer、停 hover
+        // monitor、cancel pending resize work、停几何 timer。如果不调用，destroy 路径只
+        // invalidate 几何 timer 就退出，挂在 NSEvent global/local monitor 上的两个 token
+        // 永远不会被 removeMonitor，AppKit 会持续派发 mouseMoved/Dragged 到闭包，每销毁一个
+        // 置顶会话累计一次泄漏。
+        if isMirrorPinActive
+            || isMirrorOverlayVisible
+            || mirrorLiveCapturer != nil
+            || !mirrorOverlayMouseMonitors.isEmpty
+            || pendingMirrorOutputUpdate != nil
+            || mirrorGeometryTimer != nil {
+            isMirrorPinActive = false
+            teardownMirrorCapture()
+        }
+        stateWatchdogTimer?.invalidate()
+        stateWatchdogTimer = nil
         windowAnimator.stop()
         indicatorWindow.close()
         pinControlWindow.close()
         mirrorOverlayWindow.close()
+        // 从 AccessibilityRuntimeGuard 的 messaging timeout 缓存中移除本会话持有的
+        // AX element，避免 Set 长期驻留已消亡的 AXUIElement 引用（长时间运行的
+        // 菜单栏应用累计可见的内存泄漏）。
+        AccessibilityRuntimeGuard.shared.discardMessagingTimeoutCache(for: windowElement)
+        AccessibilityRuntimeGuard.shared.discardMessagingTimeoutCache(for: appElement)
+    }
+
+    // MARK: - 状态自愈 Watchdog
+    //
+    // 这是 SideBar 的"状态机救生圈"。它只做两件事，永远不主动改 state / 几何 / 焦点：
+    //
+    // 1. 把"应显未显"的快照条捞回来。
+    //    背景：极偶发情况下，折叠动画 completion 与外部对 `windowAnimator.stop()` 的
+    //    调用产生竞争，导致 `isAnimating` 没被复位，或 `refreshIndicatorVisibility`
+    //    在 `isWindowOnScreen()` 假阴性、跨 Space 切换时被误判隐藏，最终用户看到
+    //    "窗口贴边了，但是边缘那条彩色快照条没出现"。一旦发生，**没有任何代码会再把
+    //    它救回来**——只能重启进程。该 watchdog 周期检查这种"应显未显"的死锁状态，
+    //    若命中条件就再调一次 `showIndicator(animated:false)` 把它重新 orderFront。
+    //
+    // 2. 把卡死的 `isAnimating` 复位。
+    //    背景：所有正常的展开/折叠/融合动画都远短于 3 秒。一旦 `isAnimatingSince`
+    //    跨过这个阈值仍未被复位，几乎可以确定是动画 completion 路径被吞掉了，
+    //    必须强制把 `isAnimating` 拨回 false，否则后续所有依赖它的 indicator
+    //    刷新链路都会持续 early return，永远走不出来。
+    //
+    // 注意：watchdog 不依赖、也不修改 isIndicatorSuppressed / isInFullscreenSpace /
+    // fusionHoverLock / isTemporarilyPinned 等其它状态——这些状态出错时它一律按
+    // "正常情况"对待并直接放过，让既有逻辑自己处理；watchdog 只负责打捞"明显失序"。
+    private func startStateWatchdog() {
+        stateWatchdogTimer?.invalidate()
+        stateWatchdogTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.stateWatchdogInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.runStateWatchdogTick()
+        }
+    }
+
+    private func runStateWatchdogTick() {
+        // 兜底 1：isAnimating 超时复位。
+        if isAnimating, let since = isAnimatingSince,
+           Date().timeIntervalSince(since) > Self.isAnimatingTimeoutSeconds {
+            print("⚠️ [Watchdog] \(bundleID) isAnimating 卡死 \(Int(Date().timeIntervalSince(since)))s，强制复位并停 animator")
+            // 关键：光复位 isAnimating 标志不够。CVDisplayLink 是独立跑在
+            // 显示服务线程上的，watchdog 不主动 stop() 它，一旦 hover-expand 因
+            // slow-write 补偿卡住 easing，displayLink 会以 60Hz 持续 `axSetPositionAttribute`
+            // 到目标 App，CPU 常驻高负载直到 SideBar 重启。必须显式停 animator。
+            windowAnimator.stop()
+            isAnimating = false
+        }
+
+        // 兜底 2：吸附态下，快照条应显未显时重新 showIndicator。
+        // 注意所有早退条件都和 refreshIndicatorVisibility() 主路径保持一致，避免和它打架。
+        guard case .snapped = state else { return }
+        if isAnimating { return }
+        if isIndicatorSuppressed { return }
+        if fusionHoverLock { return }
+        if isTemporarilyPinned { return }
+        if currentEdge != 1 && currentEdge != 2 { return }
+
+        let screen = getScreenForWindow()
+        if isInFullscreenSpace(screen: screen) { return }
+
+        guard isWindowOnScreen() else { return }
+
+        let isHidden = !indicatorWindow.isVisible || indicatorWindow.alphaValue < 0.1
+        guard isHidden else { return }
+
+        print("🛟 [Watchdog] \(bundleID) 检测到吸附态快照条应显未显，重新展示")
+        indicatorWindow.alphaValue = 1.0
+        showIndicator(animated: false)
     }
 
     private static func register(_ session: WindowSession) {
@@ -2427,12 +3250,25 @@ class WindowSession {
         return false
     }
 
-    private static func suppressOtherMirrorHoverActivation(excluding current: WindowSession, for duration: TimeInterval) {
+    /// 通知点击唤回时的"主窗口"选择：同 App 多窗口中只放行一个代表窗口。
+    /// 优先级：用户最近交互（展开/快捷键）过的窗口 > AXMainWindow > 注册顺序首个。
+    private static func isPreferredNotificationRevealSession(_ session: WindowSession) -> Bool {
         cleanupRegistry()
-        for box in sessionRegistry {
-            guard let session = box.session, session !== current, session.isMirrorPinActive else { continue }
-            session.suspendMirrorHoverActivation(for: duration)
+        let sessionID = ObjectIdentifier(session)
+        let candidates = sessionRegistry.compactMap { $0.session }.filter {
+            $0.pid == session.pid && $0.caseSnapped()
         }
+        guard candidates.count > 1 else {
+            return candidates.first.map { ObjectIdentifier($0) == sessionID } ?? false
+        }
+        if let preferred = preferredSessionByPID[session.pid],
+           candidates.contains(where: { ObjectIdentifier($0) == preferred }) {
+            return preferred == sessionID
+        }
+        if let mainSession = candidates.first(where: { $0.isMainWindowOfApp() }) {
+            return ObjectIdentifier(mainSession) == sessionID
+        }
+        return candidates.first.map { ObjectIdentifier($0) == sessionID } ?? false
     }
 
     private static func shouldExcludeCandidateFromFocusReturn(windowID: CGWindowID, ownerPID: pid_t) -> Bool {
@@ -2537,6 +3373,7 @@ class WindowSession {
             hoverDelayTimer?.invalidate()
             hoverInterruptTimer?.invalidate()
             outsideCollapseCandidateSince = nil
+            edgeDetachCandidateSince = nil
             lastSiblingWindowInteractionAt = nil
             pendingDockInteraction = false
             hasReleasedDockClick = false
@@ -2886,7 +3723,7 @@ class WindowSession {
         let callback: AXObserverCallback = { (observer: AXObserver, element: AXUIElement, notification: CFString, context: UnsafeMutableRawPointer?) in
             let session = Unmanaged<WindowSession>.fromOpaque(context!).takeUnretainedValue()
             if notification == kAXWindowMovedNotification as CFString {
-                if NSEvent.pressedMouseButtons & 1 != 0 {
+                if session.shouldTreatObservedMoveAsUserDrag() {
                     session.isDragging = true
                 }
                 DispatchQueue.main.async {
@@ -2932,11 +3769,38 @@ class WindowSession {
             }
             
             self.observerRunLoopSource = AXObserverGetRunLoopSource(observer)
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), self.observerRunLoopSource, .defaultMode)
+            // 显式绑定到主 run loop：保证 AX 回调始终在主线程，且 destroy() 时能从同一 run loop 上拆除。
+            CFRunLoopAddSource(CFRunLoopGetMain(), self.observerRunLoopSource, .defaultMode)
         }
     }
 
+    private func shouldTreatObservedMoveAsUserDrag() -> Bool {
+        guard NSEvent.pressedMouseButtons & 1 != 0 else { return false }
+        guard !caseSnapped() else { return false }
+        guard let sample = Self.lastGlobalMouseDownSample else { return false }
+        guard Date().timeIntervalSince(sample.at) < 30 else { return false }
+        guard sample.region == .content else { return false }
+        guard let frame = getRawWindowFrame() else { return false }
+
+        let mappedMouseDown = CGPoint(
+            x: sample.location.x,
+            y: primaryScreenHeight - sample.location.y
+        )
+        return frame.insetBy(dx: -8, dy: -8).contains(mappedMouseDown)
+    }
+
     private func handleObservedGeometryChange() {
+        // 性能优化：动画期间是"我们自己"在 60Hz 反复写 AX 位置，每一帧都会
+        // 反向触发一次 kAXWindowMovedNotification 到本回调。放任它进入
+        // showIndicator / updatePinControlWindow / syncMirrorGeometryWithSourceWindow
+        // 会在动画持续期间每 16ms 多派发一轮 AX 读 + NSPanel setFrame，白白抬高
+        // 主线程占用；等 completion 跑完后再从状态机主路径统一刷新即可。
+        if isAnimating { return }
+
+        // 标记几何已变化：checkMouseForCollapse / interactionHitTestFrame 会据此
+        // 失效缓存，重新读取真实 frame（否则会一直用旧 frame 判定鼠标内外）。
+        observedGeometryChangeToken &+= 1
+
         if relinquishToDockMinimizeIfDetachedFromEdge() {
             return
         }
@@ -2944,7 +3808,9 @@ class WindowSession {
             showIndicator(animated: false)
         }
         if isMirrorPinActive {
-            _ = refreshMirrorOverlaySnapshot(presentImmediately: false)
+            // 实时采集模式下，画面由 SCStream 推流，几何由专门的定时器跟踪；
+            // 这里只在 AX 观察到变化时立刻同步一次面板位置，缩短肉眼可感的延迟。
+            syncMirrorGeometryWithSourceWindow()
         }
         if case .expanded = state {
             showIndicator(animated: false)
@@ -2958,18 +3824,16 @@ class WindowSession {
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         isTemporarilyPinned = false
         isMirrorPinActive = false
-        isMirrorOverlayVisible = false
         pinnedAnchor = nil
         stopPinnedRaisePulse()
-        stopMirrorRefreshTimer()
+        teardownMirrorCapture()
         state = .floating
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
-        mirrorOverlayWindow.hide()
-        setMirrorSourceWindowHidden(false)
         effectWindow.stopExpandEffect(closeWindow: true)
         mouseTrackingTimer?.invalidate()
         outsideCollapseCandidateSince = nil
+        edgeDetachCandidateSince = nil
     }
     
     private func handleDestroyed() {
@@ -3147,9 +4011,38 @@ class WindowSession {
         0.01
     }
     
+    /// 判断给定的 CG bounds 是否与当前任何一块 live NSScreen 匹配。
+    /// 用于在 adopt/收编逻辑前验证锁定几何仍然有效，防止在屏幕参数变化后
+    /// 用已失效的坐标把用户刚拖出来的窗口再次钉死在旧边缘。
+    /// 复用 `cgBounds(for:)` 助手（line 1118），避免坐标转换公式再多一份 inline 副本。
+    private func displayBoundsMatchesAnyLiveScreen(_ bounds: CGRect) -> Bool {
+        for screen in NSScreen.screens {
+            let cg = cgBounds(for: screen)
+            if abs(cg.minX  - bounds.minX)  < 1 &&
+               abs(cg.minY  - bounds.minY)  < 1 &&
+               abs(cg.width - bounds.width) < 1 &&
+               abs(cg.height - bounds.height) < 1 {
+                return true
+            }
+        }
+        return false
+    }
+
     private func checkAndAdoptEdgeState() {
         guard let frame = getWindowFrame() else { return }
         let displayBounds = getDisplayBounds()
+
+        // 防护：如果 getDisplayBounds() 返回的 bounds 已经不与任何一块 live 屏幕匹配
+        //（例如刚发生分辨率切换但 handleScreenParametersChanged 尚未跑完 reseat），
+        // 任何 adopt 都会把窗口重新钉到已失效的坐标上、用户根本拖不出来。
+        // 此时主动放弃锁定，让下一次 checkAndAdoptEdgeState/detectDisplayBounds
+        // 走"动态检测"路径。
+        if snappedScreen != nil && !displayBoundsMatchesAnyLiveScreen(displayBounds) {
+            print("⚠️ \(bundleID) 检测到锁定 bounds 已失效 \(displayBounds)，主动清空以允许用户重新拖拽")
+            unlockScreen()
+            return
+        }
+
         let threshold: CGFloat = 8 // 允许一定误差
         
         let leftHiddenX = displayBounds.minX - frame.width + 1
@@ -3236,6 +4129,7 @@ class WindowSession {
         excludeFromFocusReturn(for: 0.6)
         lastCollapseTime = Date() // 记录折叠时间戳用于防抖
         outsideCollapseCandidateSince = nil
+        edgeDetachCandidateSince = nil
         lastSiblingWindowInteractionAt = nil
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
         
@@ -3318,6 +4212,7 @@ class WindowSession {
         invalidatePendingFocusRelease()
         queuedForwardedHotkeyToggle = false
         outsideCollapseCandidateSince = nil
+        edgeDetachCandidateSince = nil
         let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
         
         guard let currentFrame = getWindowFrame() else { return false }
@@ -3372,23 +4267,45 @@ class WindowSession {
         
         if isDockActivated {
             pendingDockInteraction = true
-            isAnimating = false 
+            // 关键修复：此前这里在展开动作刚开始就把 isAnimating 置为 false，
+            // 而 relinquishToDockMinimizeIfDetachedFromEdge 只在 isAnimating 为真时
+            // 吸收第三方 App 的几何抖动（见该方法的 guard !isAnimating 分支）。
+            // 一旦提前清零，dock 展开后窗口被系统/微信布局重排触发的瞬时位移
+            // 会被 AX Observer 回调（handleObservedGeometryChange）当成"脱边"，
+            // 250ms 后误降级到 .floating，claim 随之变 dockminimize，下次快捷键
+            // DockMinimize 就直接隐藏窗口、脱离接管。
+            // 这里保持 isAnimating = true 一个短暂稳定窗口（150ms），让抖动被吸收，
+            // 之后复位并消费排队 toggle。checkMouseForCollapse 内有 if isAnimating { return }
+            // 兜底，这段时间不会误触发折叠判定。
             beginTargetedActivationWindow(for: 0.45)
             setWindowPosition(position: geometry.visualHidden)
             setWindowAlpha(1.0, isHidden: false, frameHint: CGRect(origin: geometry.expanded, size: currentFrame.size))
             setWindowPosition(position: geometry.expanded)
-            
+
             // Dock 激活也同步触发特效
             let snapEdge = currentEdge == 1 ? SnapEdge.left : SnapEdge.right
             let effectColor = AppConfig.shared.getColor(for: bundleID)
             if shouldTriggerEffects {
                 self.triggerExpandEffect(edge: snapEdge, frame: currentFrame, color: effectColor)
             }
-            
+
             showIndicator(animated: false)
             startMouseTrackingTimer()
             updatePinControlWindow()
-            runQueuedForwardedHotkeyToggleIfNeeded()
+            // 延迟复位 isAnimating：给第三方 App 一个稳定窗口，期间任何 AX 几何
+            // 抖动都会被 relinquishToDockMinimizeIfDetachedFromEdge 当作动画期吸收，
+            // 不会误降级状态机。
+            // 用 animationGenerationToken 版本号保护：`isAnimating` 的 didSet 会在
+            // 任何 false → true 转换时自增 token。若 150ms 内本会话启动了新的动画
+            // （fusion / pin engage / 其它 expandWindow 路径），token 就会不匹配，
+            // 本闭包会放弃复位，从而避免把新动画的 isAnimating 状态误清零。
+            let expectedToken = animationGenerationToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self = self else { return }
+                guard self.animationGenerationToken == expectedToken else { return }
+                self.isAnimating = false
+                self.runQueuedForwardedHotkeyToggleIfNeeded()
+            }
             return true
         } else {
             // Hover logic (Slide)
@@ -3499,26 +4416,55 @@ class WindowSession {
     
     private func startMouseTrackingTimer() {
         mouseTrackingTimer?.invalidate()
+        // 清空 checkMouseForCollapse 的稳态缓存：新一轮 tracking 的窗口几何/鼠标
+        // 位置都可能已变化，不能沿用上一轮的缓存判定。
+        lastCheckedMouseLocation = nil
+        lastCheckedIsOutside = nil
+        cachedInteractionHitFrame = nil
+        cachedInteractionHitFrameAt = .distantPast
         mouseTrackingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.checkMouseForCollapse()
         }
     }
     
     private func checkMouseForCollapse() {
+        // 性能优化：展开稳态期间 mouseTrackingTimer 以 10Hz 触发本方法。若鼠标量化
+        // 位置未变、AX 几何未抖动（observedGeometryChangeToken 未变）、且上次判定
+        // 鼠标在窗口内（isOutside=false），则整轮（含 updatePinControlWindow 的 AX 读、
+        // interactionHitTestFrame 的 CGWindowList 枚举、pinControlFrames 的 AX 读）
+        // 结果都不会变——直接 return。这是把展开稳态 CPU 从 ~10% 压到接近 0 的关键。
+        // 注意：此短路仅覆盖"鼠标静止 + 几何静止 + 鼠标在窗内"这一最常见稳态；
+        // 任何一项变化（鼠标移动、窗口被第三方改写、鼠标在窗外）都会正常进入完整逻辑。
+        let rawMouseLoc = NSEvent.mouseLocation
+        let quantizedMouse = CGPoint(
+            x: (rawMouseLoc.x / Self.mouseCacheQuantum).rounded(),
+            y: (rawMouseLoc.y / Self.mouseCacheQuantum).rounded()
+        )
+        let geometryUnchanged = observedGeometryChangeToken == lastCheckedObservedGeometryToken
+        if let lastLoc = lastCheckedMouseLocation, lastLoc == quantizedMouse,
+           geometryUnchanged, lastCheckedIsOutside == false {
+            return
+        }
+
         updatePinControlWindow()
         if isAnimating { return } // 正在动画中，不进行碰撞检查
         if fusionHoverLock { return }
         if isTemporarilyPinned { return }
-        if relinquishToDockMinimizeIfDetachedFromEdge() { return }
-        
+        if relinquishToDockMinimizeIfDetachedFromEdge() {
+            // 脱边降级后几何/状态已变，清缓存避免下一轮误用。
+            lastCheckedMouseLocation = nil
+            lastCheckedIsOutside = nil
+            return
+        }
+
         guard case .expanded = state else {
             mouseTrackingTimer?.invalidate()
             outsideCollapseCandidateSince = nil
             return
         }
-        
+
         guard let frame = interactionHitTestFrame() ?? getWindowFrame() else { return }
-        let mouseLoc = NSEvent.mouseLocation
+        let mouseLoc = rawMouseLoc
         let displayHeight = primaryScreenHeight
         let mappedMouseY = displayHeight - mouseLoc.y
         let mappedMouseLoc = CGPoint(x: mouseLoc.x, y: mappedMouseY)
@@ -3537,19 +4483,39 @@ class WindowSession {
             pinSafeRectContainsMouse = false
         }
         let isOutside = !bufferRect.contains(mappedMouseLoc) && !pinSafeRectContainsMouse
+
+        // 回写"鼠标静止短路"缓存：记录本轮量化鼠标位置、isOutside、以及当前几何 token。
+        // 下一轮若三者均未变化，即可在方法入口直接 return。
+        // 注意：只在几何未抖动的稳态下缓存 isOutside 才有意义，因此同时记录 token。
+        lastCheckedMouseLocation = quantizedMouse
+        lastCheckedIsOutside = isOutside
+        lastCheckedObservedGeometryToken = observedGeometryChangeToken
+
         // 取消置顶后的短暂绕过：让自动折叠仅依赖纯几何 isOutside，
         // 避免镜像置顶 / 普通置顶过程中残留的同 PID 兄弟窗口几何/焦点状态把鼠标判定卡死。
         let bypassSiblingGrace = now < siblingGraceBypassUntil
-        let rawIsInsideSiblingWindow = isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
-        let isInsideSiblingWindow = bypassSiblingGrace ? false : rawIsInsideSiblingWindow
-        if rawIsInsideSiblingWindow && !bypassSiblingGrace {
+
+        // 性能优化：兄弟窗口的三项查询（isMouseInsideAnyVisibleSiblingWindow /
+        // hasFocusedSiblingWindowOfApp / isWithinSiblingWindowPostInteractionGrace）
+        // 都要跨进程 AX 读或整份 `CGWindowListCopyWindowInfo` 枚举，是本 timer 里
+        // 最重的一坨。它们的结果**只在**"鼠标已经越出容差框 && 不在 sibling grace 绕过期"
+        // 时才会影响下游折叠判断（见 line ~4300 的组合早退条件）——
+        // 鼠标还在窗口内（isOutside=false）时，`!isOutside` 已经导致早退，
+        // 任何 sibling 值都不会改变结果。因此直接跳过枚举，把 10Hz × N 的
+        // CGWindowList 全量扫描消掉，显著降低 mouseTrackingTimer 的基线 CPU。
+        let shouldQuerySiblingState = isOutside && !bypassSiblingGrace
+        let rawIsInsideSiblingWindow = shouldQuerySiblingState
+            ? isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
+            : false
+        let isInsideSiblingWindow = rawIsInsideSiblingWindow
+        if rawIsInsideSiblingWindow {
             lastSiblingWindowInteractionAt = now
         }
-        let isSiblingWindowFocused = bypassSiblingGrace
-            ? false
-            : (hasFocusedSiblingWindowOfApp() &&
-               NSWorkspace.shared.frontmostApplication?.processIdentifier == pid)
-        let isWithinSiblingWindowGrace = bypassSiblingGrace ? false : isWithinSiblingWindowPostInteractionGrace(now)
+        let isSiblingWindowFocused = shouldQuerySiblingState
+            && hasFocusedSiblingWindowOfApp()
+            && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        let isWithinSiblingWindowGrace = shouldQuerySiblingState
+            && isWithinSiblingWindowPostInteractionGrace(now)
 
 
         if pendingDockInteraction {
@@ -3617,8 +4583,21 @@ class WindowSession {
     }
 
     private func interactionHitTestFrame() -> CGRect? {
+        // 性能优化：展开稳态期间，AX Observer 不会上报几何变化（observedGeometryChangeToken
+        // 不变），此时窗口在 CGWindowList 中的 bounds 也不会变。复用 200ms 内的缓存结果，
+        // 完全跳过 CGWindowListCopyWindowInfo 的全量枚举（这是 checkMouseForCollapse 里
+        // 最重的单次调用）。一旦 AX 上报变化（token 递增）或缓存过期，立即重算。
+        if observedGeometryChangeToken == lastCheckedObservedGeometryToken,
+           Date().timeIntervalSince(cachedInteractionHitFrameAt) < 0.2,
+           let cached = cachedInteractionHitFrame {
+            return cached
+        }
+
         guard let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) else {
-            return getRawWindowFrame()
+            let fallback = getRawWindowFrame()
+            cachedInteractionHitFrame = fallback
+            cachedInteractionHitFrameAt = Date()
+            return fallback
         }
 
         let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -3629,15 +4608,21 @@ class WindowSession {
                 continue
             }
 
-            return CGRect(
+            let frame = CGRect(
                 x: boundsDict["X"] as? CGFloat ?? 0,
                 y: boundsDict["Y"] as? CGFloat ?? 0,
                 width: boundsDict["Width"] as? CGFloat ?? 0,
                 height: boundsDict["Height"] as? CGFloat ?? 0
             )
+            cachedInteractionHitFrame = frame
+            cachedInteractionHitFrameAt = Date()
+            return frame
         }
 
-        return getRawWindowFrame()
+        let fallback = getRawWindowFrame()
+        cachedInteractionHitFrame = fallback
+        cachedInteractionHitFrameAt = Date()
+        return fallback
     }
     
     /// 仅获取真实的物理镜像，不参与尺寸锁定逻辑，用于在收合前抓取用户手动调整的新宽度
@@ -3708,22 +4693,19 @@ class WindowSession {
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         isTemporarilyPinned = false
         isMirrorPinActive = false
-        isMirrorOverlayVisible = false
         pinnedAnchor = nil
         stopPinnedRaisePulse()
-        stopMirrorRefreshTimer()
+        teardownMirrorCapture()
         mouseTrackingTimer?.invalidate()
         hoverDelayTimer?.invalidate()
         hoverInterruptTimer?.invalidate()
         pinnedRaiseTimer?.invalidate()
-        mirrorRefreshTimer?.invalidate()
         windowAnimator.stop()
         outsideCollapseCandidateSince = nil
+        edgeDetachCandidateSince = nil
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
-        mirrorOverlayWindow.hide()
-        setMirrorSourceWindowHidden(false)
         setWindowAlpha(1.0, isHidden: false, preserveRecoveryRecord: true)
         destroy()
     }
@@ -3732,6 +4714,19 @@ class WindowSession {
 class WindowAnimator {
     private var displayLink: CVDisplayLink?
     private var startTime: CFAbsoluteTime = 0
+    /// wall-clock 时间上"animate() 被调用"的那一刻，用作**硬性超时**的基准。
+    /// 与 `startTime` 不同的是：`startTime` 会被 slow-write 补偿逻辑（line ~4560）
+    /// 反复往后推，用来让 easing 曲线在 IPC 变慢时"暂停"。而 `originalStartTime`
+    /// 从头到尾不动，用于判定"墙上时间已经过去多久了"。
+    ///
+    /// 关键 bug：hover-expand 路径开启了 `enableSlowPositionCompensation`；一旦目标
+    /// App 对 AX 响应慢或返回 `.cannotComplete`，补偿会每帧把 `startTime` 往后推
+    /// 36ms，而 wall-clock 每帧只前进 ~16ms，净变化 -20ms/帧；`progress` 被
+    /// `lastAppliedProgress` 卡在高水位、永远回不到 1.0；`finished` 永远为 false，
+    /// `CVDisplayLinkStop` 永远不被调用，孤儿 displayLink 在 60Hz 心跳里持续
+    /// `axSetPositionAttribute` 到目标 App，用户看到的就是"CPU 从 5% 飙到 30% 且必须
+    /// 重启才能恢复"。加这个硬超时是最后一道闸门。
+    private var originalStartTime: CFAbsoluteTime = 0
     private var duration: TimeInterval = 0
     private var startX: CGFloat = 0
     private var endX: CGFloat = 0
@@ -3744,6 +4739,10 @@ class WindowAnimator {
     private var hasCalledOnStart: Bool = false
     private var lastAppliedProgress: CGFloat = 0
     private var enableSlowPositionCompensation: Bool = false
+    /// 硬超时倍率。任何正常动画的 wall-clock 用时都远小于 `duration`；
+    /// 只要墙上时间已经跨过 `duration * hardTimeoutMultiplier`，无论 easing 进度如何
+    /// 都强制收尾，避免 slow-write 补偿把 displayLink 永久锁在跑。
+    private let hardTimeoutMultiplier: Double = 3.0
     
     // 跨进程频率熔断：记录上次更新指令发送的时间，防止溢出 3rd 方 App 的缓冲区
     private var lastAXUpdateTime: CFAbsoluteTime = 0
@@ -3768,7 +4767,9 @@ class WindowAnimator {
         self.onStart = onStart
         self.completion = completion
         self.hasCalledOnStart = false
-        self.startTime = CFAbsoluteTimeGetCurrent()
+        let now = CFAbsoluteTimeGetCurrent()
+        self.startTime = now
+        self.originalStartTime = now
         self.lastAppliedProgress = 0
         self.enableSlowPositionCompensation = enableSlowPositionCompensation
         
@@ -3805,6 +4806,15 @@ class WindowAnimator {
             progress = lastAppliedProgress
         }
         if progress >= 1.0 {
+            progress = 1.0
+            finished = true
+        }
+
+        // 硬性超时闸门：不管 easing 进度多少、不管 slow-write 补偿把 startTime 推到哪里，
+        // 只要墙上时间累计已经跨过 duration * hardTimeoutMultiplier，就强制收尾。
+        // 这是防止孤儿 CVDisplayLink 因 slow-write 补偿把 progress 永久卡在高水位、
+        // 导致 finished 永远为 false 的最后一道保险；一旦踩到，CPU 会持续 60Hz IPC。
+        if !finished && currentTime - originalStartTime > duration * hardTimeoutMultiplier {
             progress = 1.0
             finished = true
         }
@@ -3875,5 +4885,26 @@ class WindowAnimator {
             CVDisplayLinkStop(link)
             displayLink = nil
         }
+        // 关键修复：被外力打断（fusionHide / suspendForAccessibilityLoss /
+        // 立即展开等场景）时，必须把保存的 completion / onStart 也清空。否则
+        // 它们会在下一次 animate(...) 调用前被 completion 闭包捕获的强引用
+        // 残留下来；更严重的是，调用方期望"动画结束后才会做某件事"——一旦 stop()
+        // 静默吞掉 completion，那件"某件事"就再也不会发生（典型例子：折叠
+        // completion 里的 isAnimating = false 不会被复位，导致整套 indicator
+        // 显示链路被锁死）。
+        //
+        // 这里我们选择**不再回放 completion**：
+        // - 如果调用方还想跑 completion，它们应该让动画自己跑完，而不是 stop()；
+        // - 现有所有 stop() 调用方在调用 stop() 之后，要么紧接着发起一个新的
+        //   animate(...)（它会重新覆盖 completion / onStart），要么本身就在
+        //   destroy/suspend 路径，不再需要 completion。
+        // 因此最安全的做法就是：把 completion / onStart 主动清空，避免它们意外
+        // 被下一次动画的 tick 误触发。WindowSession 那边由 stateWatchdogTimer
+        // 兜底 isAnimating 的超时复位，所以即便此处不回放 completion，也不会
+        // 永久卡住状态机。
+        completion = nil
+        onStart = nil
+        element = nil
+        hasCalledOnStart = false
     }
 }

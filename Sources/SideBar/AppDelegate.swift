@@ -9,9 +9,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var axRuntimePausedByPermissionLoss = false
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let buildVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         print("---------------------------------------")
-        print("🚀 SideBar 已启动 - 视觉对齐与色彩同步稳定版")
-        print("🛠️ 当前二进制版本构建于: 2026-02-25 23:55 (Sync & Align)") 
+        print("🚀 SideBar \(shortVersion) (build \(buildVersion)) 已启动")
         print("---------------------------------------")
 
         NotificationCenter.default.addObserver(
@@ -26,6 +27,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             name: .accessibilityPermissionRestored,
             object: nil
         )
+        // 注意：这里**不再**为屏幕参数变化订阅 WindowRescueManager 兜底救援。
+        // 原因是它会与 AXWindowManager 的 reseat 路径处包——reseat 中 setWindowAlpha
+        // 会 upsert 一条含新 displayFrame 的 WindowRescueRecord（隐藏态），而
+        // recoverPendingWindows 拿到这条记录会强制 un-hide 并搬到"可见中位"，
+        // 使刚刚被就地重贴的隐藏窗口反而被"救"到屏幕内、状态机与实际几何脱钩。
+        // AXWindowManager 已完整覆盖 live sessions；孤儿记录由冷启动 / 权限恢复兜底即可。
         AccessibilityRuntimeGuard.shared.startWatchdog()
 
         setupMenuBarForEditActions()

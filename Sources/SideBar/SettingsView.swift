@@ -1190,7 +1190,7 @@ struct GeneralSettingsView: View {
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.6"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.2.3"
     }
     
     var body: some View {
@@ -1352,7 +1352,7 @@ struct GeneralSettingsView: View {
                                 }
                             }
 
-                            Text("用于生成置顶镜像层的窗口截图，并在切回真实窗口前显示置顶代理画面。首次点击置顶镜像层图钉时，系统会按需请求该权限。".localized)
+                            Text("用于实时读取源窗口画面，让置顶面板能够把它钉在最前。首次点击置顶图钉时，系统会按需请求该权限。".localized)
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                         }
@@ -1364,6 +1364,12 @@ struct GeneralSettingsView: View {
             }
         }
         .onChange(of: config.launchAtLogin) { newValue in
+            // 关键修复：注册/反注册失败时 AppConfig 会通过 suppressLaunchAtLoginSync
+            // 把 launchAtLogin 回滚到之前的值，这次 onChange 触发的就是回滚事件，
+            // 不应该再次调用 updateLaunchAtLogin，否则会无限重试同一个会失败的操作。
+            if config.suppressLaunchAtLoginSync {
+                return
+            }
             print("[SideBar] onChange: launchAtLogin -> \(newValue)")
             config.updateLaunchAtLogin(newValue)
             UserDefaults.standard.set(newValue, forKey: "SideBarLaunchAtLogin")
@@ -1393,9 +1399,9 @@ struct AdvancedFeaturesView: View {
 
     private var mirrorPinHelpMessage: String {
         [
-            "1. 置顶镜像层显示的是窗口截图代理，而不是真实窗口本体。".localized,
-            "2. 开启后需要授予屏幕录制权限，点击镜像层时会切回真实窗口进行交互。".localized,
-            "3. 该模式用于减少置顶窗口与其他软件之间的焦点争夺。".localized
+            "1. 置顶面板展示的是源窗口的实时画面，所有内容变化都会同步呈现。".localized,
+            "2. 启用后需要授予屏幕录制权限，鼠标移入面板时会自动切回真实窗口进行交互。".localized,
+            "3. 该模式用于在多窗口操作时让源窗口始终保持可见，并减少与其他软件之间的焦点争夺。".localized
         ].joined(separator: "\n\n")
     }
 
@@ -1452,7 +1458,7 @@ struct AdvancedFeaturesView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("置顶镜像层".localized)
+                        Text("置顶".localized)
                             .font(.headline)
 
                         VStack(alignment: .leading, spacing: 12) {
@@ -1460,7 +1466,7 @@ struct AdvancedFeaturesView: View {
                                 ZStack {
                                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                                         .fill(colorScheme == .dark ? Color.cyan.opacity(0.16) : Color.cyan.opacity(0.10))
-                                    Image(systemName: "macwindow.on.rectangle")
+                                    Image(systemName: "pin.fill")
                                         .font(.system(size: 18, weight: .semibold))
                                         .foregroundColor(.cyan)
                                 }
@@ -1468,7 +1474,7 @@ struct AdvancedFeaturesView: View {
 
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack(spacing: 6) {
-                                        Text("置顶镜像层".localized)
+                                        Text("置顶".localized)
                                             .font(.headline)
                                         HeaderHelpButton(
                                             message: mirrorPinHelpMessage,
@@ -1476,7 +1482,7 @@ struct AdvancedFeaturesView: View {
                                             width: 320
                                         )
                                     }
-                                    Text("当窗口被临时钉住后，优先显示一层可置顶的镜像代理；鼠标移入镜像层时，再切回真实窗口进行操作。".localized)
+                                    Text("把当前窗口的实时画面钉在最前面，无论焦点切到哪个软件，源窗口的最新内容始终可见。".localized)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
@@ -1490,19 +1496,19 @@ struct AdvancedFeaturesView: View {
 
                             Divider()
 
-                            VStack(alignment: .leading, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 8) {
                                 Text("触发方式".localized)
                                     .font(.system(size: 12, weight: .semibold))
                                     .foregroundColor(.secondary)
 
-                                MirrorPinGuideDemo()
-                                    .frame(height: 208)
-
-                                Text("先展开窗口，再将鼠标移动到靠近屏幕中心一侧的顶角区域，让图钉按钮滑出；点击图钉后，窗口会进入置顶镜像层状态。".localized)
+                                Text("先展开窗口，再将鼠标移动到靠近屏幕中心一侧的顶角区域，让图钉按钮滑出；点击图钉后，窗口会进入置顶状态，鼠标移回置顶面板即可切回真实窗口继续操作。".localized)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
+
+                            PinOnTopGuideView()
+                                .padding(.top, 4)
                         }
                         .padding(18)
                         .background(colorScheme == .dark ? Color(NSColor.windowBackgroundColor).opacity(0.88) : Color.white.opacity(0.82))
@@ -1520,253 +1526,306 @@ struct AdvancedFeaturesView: View {
     }
 }
 
-private struct MirrorPinGuideDemo: View {
+// MARK: - 置顶触发演示动画
+
+private struct PinOnTopGuideView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @State private var phase: Int = 0
-    private let phaseTimer = Timer.publish(every: 1.15, on: .main, in: .common).autoconnect()
-    private let titles = [
-        "角区滑出图钉".localized,
-        "点击后进入镜像层".localized,
-        "点击镜像层切回真实窗口".localized
+    /// 图钉是否已经滑出。与 `phase` 解耦：phase 转到 1 后，等鼠标动画把指针送到角区
+    /// 才把这个值置为 true，避免"指针还在路上图钉就先滑出"的违和感。
+    @State private var pinSlid: Bool = false
+    private let timer = Timer.publish(every: 1.6, on: .main, in: .common).autoconnect()
+    /// 指针从屏外移到角区使用的动画时长，与下方 `.animation(.easeInOut(duration: 0.5), value: phase)` 保持一致。
+    private let cursorTravelDuration: Double = 0.5
+
+    private let phaseLabels = [
+        "1. 移到角区".localized,
+        "2. 图钉滑出".localized,
+        "3. 点击置顶".localized,
+        "4. 置顶生效".localized,
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            MirrorPinGuideScene(phase: phase)
-                .frame(height: 148)
-                .background(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.09, green: 0.14, blue: 0.17),
-                                    Color(red: 0.11, green: 0.18, blue: 0.21)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
-                )
+        VStack(spacing: 10) {
+            GeometryReader { geo in
+                let w = geo.size.width
+                let h = geo.size.height
+                let winW = w * 0.54
+                let winH = h * 0.55
+                let winX: CGFloat = 20
+                let winY = (h - winH) / 2
+                let winRect = CGRect(x: winX, y: winY, width: winW, height: winH)
 
-            HStack(spacing: 8) {
-                ForEach(0..<3, id: \.self) { index in
-                    Capsule(style: .continuous)
-                        .fill(index == phase ? Color.cyan.opacity(0.88) : Color.white.opacity(0.14))
-                        .frame(width: index == phase ? 26 : 8, height: 6)
-                        .animation(.easeInOut(duration: 0.22), value: phase)
+                let hotW: CGFloat = 44
+                let hotH: CGFloat = 36
+                let hotX = winRect.maxX - hotW
+                let hotY = winRect.minY + 4
+
+                let pinSize: CGFloat = 28
+                let pinHiddenX = winRect.maxX - 14
+                let pinShownX = winRect.maxX + 6
+                let pinY = winRect.minY + 10
+
+                let pinVisible = pinSlid
+                let isPinned = phase == 3
+                let isClicking = phase == 2
+
+                let cursor = cursorPosition(phase: phase, win: winRect, hot: CGPoint(x: hotX, y: hotY), pinShownX: pinShownX, pinSize: pinSize, pinY: pinY)
+                let pinButtonX = pinButtonPosition(phase: phase, hiddenX: pinHiddenX, shownX: pinShownX, pinVisible: pinVisible, pinSize: pinSize)
+
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(colorScheme == .dark
+                            ? Color(red: 0.07, green: 0.11, blue: 0.15)
+                            : Color(red: 0.90, green: 0.91, blue: 0.94))
+
+                    PinGuideWindowMock(isPinnedGlow: isPinned)
+                        .frame(width: winW, height: winH)
+                        .offset(x: winX, y: winY)
+
+                    if phase <= 1 {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.cyan.opacity(phase == 0 ? 0.12 : 0.18))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
+                                    .foregroundColor(Color.cyan.opacity(0.35))
+                            )
+                            .frame(width: hotW, height: hotH)
+                            .offset(x: hotX, y: hotY)
+                            .animation(.easeInOut(duration: 0.3), value: phase)
+                    }
+
+                    PinGuidePinButton(tilted: pinVisible && !isPinned, active: isPinned)
+                        .frame(width: pinSize, height: pinSize)
+                        .offset(x: pinButtonX, y: pinY)
+                        .opacity(pinVisible ? 1 : 0)
+                        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: phase)
+                        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: pinVisible)
+
+                    if isPinned {
+                        PinGuidePinnedBadge()
+                            .offset(x: winRect.maxX + 2, y: winRect.minY - 26)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+
+                    // 点击阶段：在指针落点周围渲染两圈向外扩散的水波，
+                    // 让观看者一眼看出当前是在"按下"图钉而不仅仅是悬停。
+                    if isClicking {
+                        PinGuideClickRipple()
+                            .frame(width: 42, height: 42)
+                            .offset(x: pinShownX + pinSize * 0.5 - 21,
+                                    y: pinY + pinSize * 0.5 - 21)
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                    }
+
+                    PinGuideCursor()
+                        .frame(width: 22, height: 22)
+                        .offset(x: cursor.x, y: cursor.y)
+                        .animation(.easeInOut(duration: 0.5), value: phase)
                 }
             }
-            
-            Text(titles[phase])
-                .font(.system(size: 12, weight: .semibold))
+            .frame(height: 132)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+
+            HStack(spacing: 6) {
+                ForEach(0 ..< 4, id: \.self) { i in
+                    Capsule()
+                        .fill(i == phase ? Color.cyan : Color.secondary.opacity(0.28))
+                        .frame(width: i == phase ? 20 : 6, height: 6)
+                        .animation(.easeInOut(duration: 0.2), value: phase)
+                }
+            }
+
+            Text(phaseLabels[phase])
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.primary)
         }
-        .onReceive(phaseTimer) { _ in
+        .onReceive(timer) { _ in
             withAnimation(.easeInOut(duration: 0.22)) {
-                phase = (phase + 1) % 3
+                phase = (phase + 1) % phaseLabels.count
+            }
+        }
+        .onChange(of: phase) { newPhase in
+            switch newPhase {
+            case 0:
+                // 指针离开角区：图钉直接快速收回去，便于下一轮循环。
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    pinSlid = false
+                }
+            case 1:
+                // 等指针沿 easeInOut(0.5) 真正抵达青色虚线区域后，再把图钉滑出来。
+                let snapshotPhase = newPhase
+                DispatchQueue.main.asyncAfter(deadline: .now() + cursorTravelDuration) {
+                    // 防止在等待期间用户切走 / 计时器跳过当前阶段时仍然误触发滑出。
+                    guard phase == snapshotPhase else { return }
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                        pinSlid = true
+                    }
+                }
+            default:
+                if !pinSlid {
+                    pinSlid = true
+                }
             }
         }
     }
-}
 
-private struct MirrorPinGuideScene: View {
-    let phase: Int
-
-    var body: some View {
-        GeometryReader { geo in
-            let sceneWidth = geo.size.width
-            let sceneHeight = geo.size.height
-            let windowWidth = min(sceneWidth * 0.58, 320)
-            let windowHeight = min(sceneHeight * 0.82, 118)
-            let windowRect = CGRect(x: 26, y: 16, width: windowWidth, height: windowHeight)
-            let hotZoneRect = CGRect(x: windowRect.maxX - 34, y: windowRect.minY + 4, width: 62, height: 58)
-            let pinVisible = phase >= 1
-            let mirrorVisible = phase == 2
-            let pinFrame = CGRect(x: windowRect.maxX + (pinVisible ? 10 : -14), y: windowRect.minY + 8, width: 36, height: 36)
-            let proxyRect = CGRect(x: windowRect.minX, y: windowRect.minY, width: windowRect.width, height: windowRect.height)
-            let cursorPoint: CGPoint = {
-                switch phase {
-                case 0:
-                    return CGPoint(x: hotZoneRect.minX + 20, y: hotZoneRect.minY + 14)
-                case 1:
-                    return CGPoint(x: pinFrame.minX + 8, y: pinFrame.minY + 10)
-                default:
-                    return CGPoint(x: proxyRect.maxX - 42, y: proxyRect.minY + 18)
-                }
-            }()
-
-            ZStack(alignment: .topLeading) {
-                MirrorPinGuideWindow(isDimmed: mirrorVisible)
-                    .frame(width: windowRect.width, height: windowRect.height)
-                    .offset(x: windowRect.minX, y: windowRect.minY)
-
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.white.opacity(phase == 0 ? 0.12 : 0.08))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(Color.white.opacity(phase == 0 ? 0.18 : 0.10), lineWidth: 1)
-                    )
-                    .frame(width: hotZoneRect.width, height: hotZoneRect.height)
-                    .offset(x: hotZoneRect.minX, y: hotZoneRect.minY)
-                    .opacity(mirrorVisible ? 0.18 : 1)
-
-                MirrorPinGuideButton()
-                    .frame(width: pinFrame.width, height: pinFrame.height)
-                    .offset(x: pinFrame.minX, y: pinFrame.minY)
-                    .opacity(pinVisible ? 1 : 0)
-                    .animation(.spring(response: 0.26, dampingFraction: 0.82), value: pinVisible)
-
-                MirrorPinGuideWindow(isMirrorProxy: true)
-                    .frame(width: proxyRect.width, height: proxyRect.height)
-                    .offset(x: proxyRect.minX, y: proxyRect.minY)
-                    .opacity(mirrorVisible ? 1 : 0)
-                    .scaleEffect(mirrorVisible ? 1.0 : 0.985, anchor: .topLeading)
-                    .shadow(color: Color.black.opacity(mirrorVisible ? 0.28 : 0), radius: 22, y: 12)
-                    .animation(.easeOut(duration: 0.22), value: mirrorVisible)
-
-                if mirrorVisible {
-                    Text("镜像层".localized)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.92))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color.cyan.opacity(0.20))
-                        )
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .stroke(Color.cyan.opacity(0.35), lineWidth: 1)
-                        )
-                        .offset(x: proxyRect.minX + 14, y: proxyRect.maxY - 26)
-                        .transition(.opacity)
-                }
-
-                DemoCursor(glowOpacity: phase == 1 ? 0.32 : 0.22)
-                    .frame(width: 24, height: 24)
-                    .offset(x: cursorPoint.x, y: cursorPoint.y)
-                    .animation(.easeInOut(duration: 0.24), value: phase)
-            }
+    private func cursorPosition(phase: Int, win: CGRect, hot: CGPoint, pinShownX: CGFloat, pinSize: CGFloat, pinY: CGFloat) -> CGPoint {
+        switch phase {
+        case 0:  return CGPoint(x: win.maxX + 48, y: win.minY + 22)
+        case 1:  return CGPoint(x: hot.x + 16, y: hot.y + 14)
+        case 2:  return CGPoint(x: pinShownX + pinSize * 0.5 - 2, y: pinY + pinSize * 0.5 - 4)
+        default: return CGPoint(x: win.maxX + 36, y: win.minY + 8)
         }
+    }
+
+    private func pinButtonPosition(phase: Int, hiddenX: CGFloat, shownX: CGFloat, pinVisible: Bool, pinSize: CGFloat) -> CGFloat {
+        let isPinned = phase == 3
+        let isClicked = phase == 2
+        return (isClicked || isPinned || pinVisible) ? shownX : hiddenX
     }
 }
 
-private struct MirrorPinGuideWindow: View {
-    var isDimmed: Bool = false
-    var isMirrorProxy: Bool = false
+private struct PinGuideWindowMock: View {
+    @Environment(\.colorScheme) private var colorScheme
+    var isPinnedGlow: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Circle().fill(Color.red.opacity(0.98)).frame(width: 10, height: 10)
-                Circle().fill(Color.yellow.opacity(0.98)).frame(width: 10, height: 10)
-                Circle().fill(Color.green.opacity(0.98)).frame(width: 10, height: 10)
+            HStack(spacing: 6) {
+                Circle().fill(Color.red.opacity(0.9)).frame(width: 8, height: 8)
+                Circle().fill(Color.yellow.opacity(0.9)).frame(width: 8, height: 8)
+                Circle().fill(Color.green.opacity(0.9)).frame(width: 8, height: 8)
                 Spacer()
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Color.white.opacity(0.20))
-                    .frame(width: 52, height: 10)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.white.opacity(0.18))
+                    .frame(width: 42, height: 8)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 26)
-            .background(Color.white.opacity(isMirrorProxy ? 0.12 : 0.05))
+            .padding(.horizontal, 10)
+            .frame(height: 22)
+            .background(Color.white.opacity(0.06))
 
             HStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Quick Notes")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.92))
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(Color.white.opacity(0.82))
-                        .frame(width: 72, height: 8)
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(Color.white.opacity(0.24))
-                        .frame(width: 102, height: 7)
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.cyan.opacity(0.82))
-                        .frame(width: 86, height: 30)
+                VStack(alignment: .leading, spacing: 6) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.white.opacity(0.78))
+                        .frame(width: 56, height: 6)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.white.opacity(0.22))
+                        .frame(width: 80, height: 5)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.white.opacity(0.22))
+                        .frame(width: 64, height: 5)
                 }
-                .padding(14)
-                .frame(width: 118, alignment: .topLeading)
-                .background(Color.white.opacity(0.03))
-
-                Rectangle()
-                    .fill(Color.white.opacity(0.06))
-                    .frame(width: 1)
-
-                VStack(alignment: .leading, spacing: 9) {
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(Color.white.opacity(0.74))
-                        .frame(width: 92, height: 8)
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(Color.white.opacity(0.18))
-                        .frame(width: 58, height: 7)
-                }
-                .padding(16)
+                .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(
-                    isMirrorProxy
-                    ? LinearGradient(
-                        colors: [Color.white.opacity(0.18), Color.white.opacity(0.10)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    : LinearGradient(
-                        colors: [Color.black.opacity(isDimmed ? 0.55 : 0.86), Color.black.opacity(isDimmed ? 0.48 : 0.80)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            RoundedRectangle(cornerRadius: 10)
+                .fill(colorScheme == .dark
+                    ? Color.black.opacity(0.75)
+                    : Color.white.opacity(0.92))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(isMirrorProxy ? Color.white.opacity(0.20) : Color.white.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isPinnedGlow ? Color.cyan.opacity(0.45) : Color.white.opacity(0.08), lineWidth: isPinnedGlow ? 2 : 1)
         )
+        .shadow(color: isPinnedGlow ? Color.cyan.opacity(0.2) : Color.clear, radius: 18, x: 0, y: 0)
+        .shadow(color: Color.black.opacity(isPinnedGlow ? 0.25 : 0.2), radius: 8, y: 3)
+        .animation(.easeInOut(duration: 0.4), value: isPinnedGlow)
     }
 }
 
-private struct MirrorPinGuideButton: View {
-    var body: some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(Color.white.opacity(0.18))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
-            )
-            .overlay(
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white.opacity(0.94))
-            )
-    }
-}
-
-private struct DemoCursor: View {
-    var glowOpacity: Double = 0.24
-    private let cursorImage = NSCursor.arrow.image
+private struct PinGuidePinButton: View {
+    var tilted: Bool = false
+    var active: Bool = false
 
     var body: some View {
         ZStack {
-            Circle()
-                .fill(Color.white.opacity(glowOpacity))
-                .frame(width: 30, height: 30)
-                .blur(radius: 14)
-
-            Image(nsImage: cursorImage)
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(width: 26, height: 34)
-                .shadow(color: .black.opacity(0.34), radius: 5, y: 2)
+            RoundedRectangle(cornerRadius: 10)
+                .fill(active ? Color.cyan.opacity(0.25) : Color.white.opacity(0.14))
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(active ? Color.cyan.opacity(0.5) : Color.white.opacity(0.12), lineWidth: 1)
+            Image(systemName: "pin.fill")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(active ? .cyan : .white.opacity(0.88))
+                .rotationEffect(tilted ? .degrees(30) : .degrees(0))
+                .animation(.spring(response: 0.2, dampingFraction: 0.5), value: tilted)
         }
     }
 }
+
+private struct PinGuidePinnedBadge: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "pin.fill")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.cyan)
+            Text("已置顶".localized)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.cyan.opacity(0.95))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(Color.cyan.opacity(0.15))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.cyan.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct PinGuideCursor: View {
+    private let cursorImage = NSCursor.arrow.image
+
+    var body: some View {
+        Image(nsImage: cursorImage)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .shadow(color: .black.opacity(0.35), radius: 4, y: 2)
+    }
+}
+
+/// 点击提示动画：在指针落点周围渲染两圈错相位的水波，
+/// 让小尺寸演示图也能直观读出"这里发生了一次点击"。
+private struct PinGuideClickRipple: View {
+    @State private var animateFirst: Bool = false
+    @State private var animateSecond: Bool = false
+
+    var body: some View {
+        ZStack {
+            ripple(expanded: animateFirst)
+            ripple(expanded: animateSecond)
+        }
+        .onAppear {
+            // 第一圈立刻发射
+            withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
+                animateFirst = true
+            }
+            // 第二圈半个周期后再发射，形成连绵的"咚咚"两下点击感
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
+                    animateSecond = true
+                }
+            }
+        }
+    }
+
+    private func ripple(expanded: Bool) -> some View {
+        Circle()
+            .strokeBorder(Color.cyan.opacity(0.75), lineWidth: 1.4)
+            .scaleEffect(expanded ? 1.7 : 0.35)
+            .opacity(expanded ? 0.0 : 0.9)
+    }
+}
+
 
 struct InteractionSettingsView: View {
     @ObservedObject var config: AppConfig
@@ -1832,9 +1891,29 @@ private final class TickSliderTrackingView: NSView {
     var onDown: ((CGPoint) -> Void)?
     var onDrag: ((CGPoint) -> Void)?
     var onUp: (() -> Void)?
+    var onMove: ((CGPoint) -> Void)?
+    var onExit: (() -> Void)?
+
+    private var hoverTrackingArea: NSTrackingArea?
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    /// 安装 / 刷新用于悬停探测的 tracking area（尺寸变化时会被系统回调重建）。
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = hoverTrackingArea {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
     }
 
     /// 关键：返回 false 会让 NSWindow 把 mouseDown 当作「拖窗口」，
@@ -1854,18 +1933,36 @@ private final class TickSliderTrackingView: NSView {
     override func mouseUp(with event: NSEvent) {
         onUp?()
     }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        onMove?(p)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        onMove?(p)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onExit?()
+    }
 }
 
 private struct TickSliderInteractionLayer: NSViewRepresentable {
     let onDown: (CGPoint) -> Void
     let onDrag: (CGPoint) -> Void
     let onUp: () -> Void
+    var onMove: (CGPoint) -> Void = { _ in }
+    var onExit: () -> Void = { }
 
     func makeNSView(context: Context) -> TickSliderTrackingView {
         let view = TickSliderTrackingView()
         view.onDown = onDown
         view.onDrag = onDrag
         view.onUp = onUp
+        view.onMove = onMove
+        view.onExit = onExit
         return view
     }
 
@@ -1873,14 +1970,17 @@ private struct TickSliderInteractionLayer: NSViewRepresentable {
         nsView.onDown = onDown
         nsView.onDrag = onDrag
         nsView.onUp = onUp
+        nsView.onMove = onMove
+        nsView.onExit = onExit
     }
 }
 
 /// 与设计稿一致的"刻度密集型"滑块：
 /// - 多根均匀分布的竖线作为刻度
 /// - 已达成区域：橙色刻度
-/// - 中央拖柄：橙色粗竖条，比刻度更高、上下凸出
-/// - 拖柄左右两侧 2~3 根刻度高度做渐降过渡
+/// - 中央拖柄：由最靠近的刻度「长成」的橙色粗竖条（非独立图层），两侧渐降过渡
+/// - 归位：临界阻尼平滑到位，无位置过冲
+/// - 到达终点后：沿行驶方向扩散一次冲击波，令前方短竖线「先变长再变短」形成波浪感
 /// - 拖动时，拖柄附近的刻度会有正弦波动微动画
 struct TickSlider: View {
     @Binding var doubleValue: Double
@@ -1891,107 +1991,297 @@ struct TickSlider: View {
     /// 主题色（默认设置面板里的橙色）
     static let defaultAccent = Color(red: 252.0 / 255.0, green: 133.0 / 255.0, blue: 12.0 / 255.0)
     var accent: Color = TickSlider.defaultAccent
+    /// 悬停提示文案格式化（返回 nil 则不显示气泡）；入参为吸附到步进后的数值
+    var tooltipFormatter: ((Double) -> String)? = nil
     
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isDragging: Bool = false
     @State private var ripplePhase: CGFloat = 0
+    /// 粗竖线（拖柄）当前的可视进度 0...1，与数值解耦以便做平滑「跑过去」动画
+    @State private var knobProgress: Double = 0
+    @State private var didInitKnob: Bool = false
+    /// 悬停指针在滑轨内的 x 坐标（nil 表示未悬停）
+    @State private var hoverX: CGFloat? = nil
+
+    // MARK: 冲击波（到达终点后向前扩散的"波浪"）
+    /// 冲击波是否正在播放
+    @State private var waveActive: Bool = false
+    /// 冲击波已播放的时长（秒）
+    @State private var waveClock: Double = 0
+    /// 冲击波源点（拖柄落点的连续刻度坐标）
+    @State private var waveOrigin: Double = 0
+    /// 冲击波扩散方向：+1 向右、-1 向左（= 拖柄行驶方向）
+    @State private var waveDir: Double = 1
+    /// 本次交互记录的行驶方向，松手/落定时用于决定冲击波扩散方向
+    @State private var pendingWaveDir: Double = 1
+
+    /// 拖柄归位动画的弹性响应时长（临界阻尼，无位置过冲）
+    private static let knobResponse: Double = 0.3
+    /// 拖柄"抵达终点"后再触发冲击波的延迟，制造撞击→扩散的因果感
+    private static let knobArriveDelay: Double = 0.18
+    /// 波前每秒行进的刻度数
+    private static let waveSpeed: Double = 30
+    /// 单个刻度受影响的"波包"半宽（刻度数）
+    private static let waveSigma: Double = 0.85
+    /// 波峰最大抬高像素
+    private static let waveAmp: Double = 5.0
+    /// 振幅随离源点距离的衰减尺度（刻度数）
+    private static let waveDecay: Double = 3.2
+    /// 波前起始时略微"退后"，让源点也经历一次由小到大再回落
+    private static let waveLead: Double = 0.85
+    /// 冲击波总时长（秒），到点即结束
+    private static let waveDuration: Double = 0.42
+
     private let rippleTimer = Timer.publish(every: 1.0 / 45.0, on: .main, in: .common).autoconnect()
     
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
             let height: CGFloat = 26
-            let progress = computeProgress()
-            let activeFloat = progress * Double(tickCount - 1)
-            let activeIndex = Int(activeFloat.rounded())
-            
-            ZStack {
-                // 刻度阵列（无独立拖柄；当前位置的刻度本身被加粗加高）
+            let knobFloat = knobProgress * Double(max(1, tickCount - 1))
+
+            ZStack(alignment: .topLeading) {
+                // 刻度阵列（跟随拖柄位置做高度渐降 / 橙色填充）
                 HStack(spacing: 0) {
                     ForEach(0..<tickCount, id: \.self) { i in
-                        tickBar(index: i, activeIndex: activeIndex)
+                        tickBar(index: i, knobFloat: knobFloat)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
 
-                // AppKit 拦截层放在最上面，吃掉所有鼠标事件，
+                // AppKit 拦截层：吃掉所有鼠标事件，
                 // 防止 isMovableByWindowBackground 误把拖动当作移动窗口
                 TickSliderInteractionLayer(
                     onDown: { p in
                         isDragging = true
-                        applyProgress(Double(max(0, min(1, p.x / max(1, width)))))
+                        let raw = clamp01(Double(p.x / max(1, width)))
+                        hoverX = clampX(p.x, width: width)
+                        applyValue(rawProgress: raw)
+                        // 点击：记录行驶方向，竖线平滑「跑」到点击处（冲击波在松手时统一触发）
+                        let target = snappedProgress(raw)
+                        pendingWaveDir = target >= knobProgress ? 1 : -1
+                        moveKnob(to: target, animated: !reduceMotion)
                     },
                     onDrag: { p in
-                        applyProgress(Double(max(0, min(1, p.x / max(1, width)))))
+                        let raw = clamp01(Double(p.x / max(1, width)))
+                        hoverX = clampX(p.x, width: width)
+                        applyValue(rawProgress: raw)
+                        // 拖动：竖线实时跟手，不做弹簧延迟；持续更新行驶方向
+                        if abs(raw - knobProgress) > 0.0005 {
+                            pendingWaveDir = raw >= knobProgress ? 1 : -1
+                        }
+                        moveKnob(to: raw, animated: false)
                     },
                     onUp: {
                         isDragging = false
+                        // 松手：吸附到步进刻度，抵达后沿行驶方向扩散一次冲击波
+                        let target = computeProgress()
+                        moveKnob(to: target, animated: !reduceMotion)
+                        scheduleWave(origin: target, dir: pendingWaveDir)
+                    },
+                    onMove: { p in
+                        if !isDragging { hoverX = clampX(p.x, width: width) }
+                    },
+                    onExit: {
+                        if !isDragging { hoverX = nil }
                     }
                 )
                 .frame(width: width, height: height)
+
+                // 悬停提示气泡
+                if let hx = hoverX, let text = tooltipText(atX: hx, width: width) {
+                    tooltipBubble(text)
+                        .position(x: clampTooltipX(hx, width: width), y: -13)
+                        .allowsHitTesting(false)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        .zIndex(10)
+                }
             }
             .frame(width: width, height: height)
+            .onAppear {
+                if !didInitKnob {
+                    knobProgress = computeProgress()
+                    didInitKnob = true
+                }
+            }
+            .onChange(of: doubleValue) { _ in
+                // 外部改动（例如「重置」按钮）→ 让竖线平滑跑过去并扩散冲击波
+                guard !isDragging else { return }
+                let target = computeProgress()
+                let dir: Double = target >= knobProgress ? 1 : -1
+                moveKnob(to: target, animated: !reduceMotion)
+                scheduleWave(origin: target, dir: dir)
+            }
+            .animation(.easeOut(duration: 0.12), value: hoverX == nil)
             .onReceive(rippleTimer) { _ in
-                guard !reduceMotion, isDragging else { return }
-                ripplePhase += 0.42
-                if ripplePhase > .pi * 200 { ripplePhase = 0 }
+                if !reduceMotion, isDragging {
+                    ripplePhase += 0.42
+                    if ripplePhase > .pi * 200 { ripplePhase = 0 }
+                }
+                if waveActive {
+                    waveClock += 1.0 / 45.0
+                    if waveClock >= Self.waveDuration { waveActive = false }
+                }
             }
         }
         .frame(height: 26)
     }
+
+    private func tooltipBubble(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule(style: .continuous).fill(accent))
+            .shadow(color: Color.black.opacity(0.18), radius: 3, y: 1)
+            .fixedSize()
+    }
     
-    private func tickBar(index: Int, activeIndex: Int) -> some View {
-        let dist = abs(index - activeIndex)
-        let isActive = index <= activeIndex
-        let isKnob = (dist == 0)
-        // 拖柄附近：往两侧渐降（截图里那种"靠中间高、向外低"的视觉节奏）
-        let baseHeight: CGFloat = {
-            switch dist {
-            case 0: return 20            // 当前位置：原地加高加粗，作为"拖柄"
-            case 1: return 13
-            case 2: return 11
-            case 3: return 9
-            default: return 8
-            }
-        }()
-        let baseWidth: CGFloat = {
-            switch dist {
-            case 0: return 3.0           // 当前位置：加粗
-            case 1: return 1.6
-            default: return 1.4
-            }
-        }()
-        // 拖动时附近刻度的正弦微抖动（不影响当前位置的拖柄本身）
+    /// 刻度竖线：最靠近拖柄的那根会「长成」又粗又高的竖线（拖柄本体即由刻度生长而来），
+    /// 两侧向外渐降；到达终点后再叠加向前扩散的冲击波。
+    private func tickBar(index: Int, knobFloat: Double) -> some View {
+        let dist = abs(Double(index) - knobFloat)
+        let isActive = Double(index) <= knobFloat + 0.5
+
+        // 拖柄峰形：emphasis 1 → 完整粗竖线；向两侧平滑衰减 → 普通刻度
+        let emphasis = knobEmphasis(dist)
+        let baseTickHeight: CGFloat = 8
+        let knobHeight: CGFloat = 20
+        let baseHeight = baseTickHeight + (knobHeight - baseTickHeight) * emphasis
+
+        let baseTickWidth: CGFloat = 1.4
+        let knobWidth: CGFloat = 3.0
+        let barWidth = baseTickWidth + (knobWidth - baseTickWidth) * emphasis
+
+        // 拖动时附近刻度的正弦微抖动（拖柄本体不参与）
         var ripple: CGFloat = 0
-        if isDragging, dist > 0, dist <= 6 {
+        if isDragging, dist > 0.5, dist <= 6 {
             let attenuation: CGFloat = max(0, 1.0 - CGFloat(dist) / 6.0)
             ripple = sin(ripplePhase - CGFloat(dist) * 0.55) * 2.0 * attenuation
         }
-        let h = baseHeight + ripple
+
+        // 冲击波：到达终点后向行驶方向扩散，让前方短竖线略微「变长又变短」
+        let wave = wavePulse(index: index)
+
+        let h = baseHeight + ripple + wave
+        let fill = isActive
+            ? accent.opacity(0.9 + 0.1 * Double(emphasis))
+            : Color.gray.opacity(0.32)
         return Capsule(style: .continuous)
-            .fill(isActive ? accent.opacity(isKnob ? 1.0 : 0.95) : Color.gray.opacity(0.32))
-            .frame(width: baseWidth, height: max(3, h))
-            .shadow(color: isKnob ? accent.opacity(isDragging ? 0.45 : 0.22) : .clear,
-                    radius: isKnob ? (isDragging ? 4 : 2) : 0)
+            .fill(fill)
+            .frame(width: barWidth, height: max(3, h))
+            .shadow(color: emphasis > 0.35
+                        ? accent.opacity((isDragging ? 0.42 : 0.24) * Double(emphasis))
+                        : .clear,
+                    radius: emphasis > 0.35 ? (isDragging ? 4 : 2) * emphasis : 0)
     }
 
-    
+    /// 拖柄峰形权重：0...1，中心为 1，约 2 个刻度外归零（平方衰减，中心更聚拢）。
+    private func knobEmphasis(_ dist: Double) -> CGFloat {
+        let t = max(0.0, 1.0 - dist / 2.0)
+        return CGFloat(t * t)
+    }
+
+    /// 单根刻度上的冲击波抬高量（像素）。仅影响源点及其行驶方向前方的刻度。
+    private func wavePulse(index: Int) -> CGFloat {
+        guard waveActive else { return 0 }
+        // 行驶方向上的有向距离：<0 表示在源点后方，不受影响
+        let signedD = (Double(index) - waveOrigin) * waveDir
+        guard signedD >= -0.01 else { return 0 }
+        // 波前位置（略微退后起步，让源点也经历由小到大再回落）
+        let front = waveClock * Self.waveSpeed - Self.waveLead
+        let x = (front - signedD) / Self.waveSigma
+        guard abs(x) < 3 else { return 0 }               // 波包之外，跳过
+        let envelope = exp(-signedD / Self.waveDecay)     // 越远抬高越小
+        let pulse = Self.waveAmp * envelope * exp(-x * x) // 高斯波包：随波前经过先增后减
+        return CGFloat(pulse)
+    }
+
+    // MARK: - 计算辅助
+
+    private func clamp01(_ v: Double) -> Double { max(0, min(1, v)) }
+
+    private func clampX(_ x: CGFloat, width: CGFloat) -> CGFloat {
+        max(0, min(width, x))
+    }
+
+    private func clampTooltipX(_ x: CGFloat, width: CGFloat) -> CGFloat {
+        guard width > 44 else { return width / 2 }
+        return max(22, min(width - 22, x))
+    }
+
     private func computeProgress() -> Double {
         let span = range.upperBound - range.lowerBound
         guard span > 0 else { return 0 }
-        return max(0, min(1, (doubleValue - range.lowerBound) / span))
+        return clamp01((doubleValue - range.lowerBound) / span)
     }
-    
-    private func applyProgress(_ p: Double) {
+
+    /// 将任意进度吸附到步进刻度后，返回其对应的进度值。
+    private func snappedProgress(_ p: Double) -> Double {
         let span = range.upperBound - range.lowerBound
-        let raw = range.lowerBound + p * span
+        guard span > 0 else { return 0 }
+        let clampedValue = snappedValue(p)
+        return clamp01((clampedValue - range.lowerBound) / span)
+    }
+
+    /// 将任意进度换算成吸附到步进刻度后的真实数值。
+    private func snappedValue(_ p: Double) -> Double {
+        let span = range.upperBound - range.lowerBound
+        let raw = range.lowerBound + clamp01(p) * span
         let snapped = (raw / step).rounded() * step
-        let clamped = max(range.lowerBound, min(range.upperBound, snapped))
+        return max(range.lowerBound, min(range.upperBound, snapped))
+    }
+
+    private func applyValue(rawProgress p: Double) {
+        let clamped = snappedValue(p)
         if clamped != doubleValue {
             doubleValue = clamped
         }
+    }
+
+    /// 移动拖柄。`animated` 时用临界阻尼弹簧平滑归位，**不做位置过冲**（不再冲过终点回弹）。
+    private func moveKnob(to progress: Double, animated: Bool) {
+        if animated {
+            withAnimation(.spring(response: Self.knobResponse, dampingFraction: 1.0)) {
+                knobProgress = progress
+            }
+        } else {
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) {
+                knobProgress = progress
+            }
+        }
+    }
+
+    /// 在拖柄「抵达」终点后，从落点沿行驶方向扩散一次冲击波。
+    private func scheduleWave(origin progress: Double, dir: Double) {
+        guard !reduceMotion else { return }
+        let originFloat = progress * Double(max(1, tickCount - 1))
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.knobArriveDelay) {
+            startWave(origin: originFloat, dir: dir)
+        }
+    }
+
+    /// 真正启动冲击波。拖动中或降低动态效果时忽略。
+    private func startWave(origin: Double, dir: Double) {
+        guard !reduceMotion, !isDragging else { return }
+        waveOrigin = origin
+        waveDir = dir == 0 ? 1 : dir
+        waveClock = 0
+        waveActive = true
+    }
+
+    private func tooltipText(atX x: CGFloat, width: CGFloat) -> String? {
+        let raw = clamp01(Double(x / max(1, width)))
+        let value = snappedValue(raw)
+        if let formatter = tooltipFormatter {
+            return formatter(value)
+        }
+        return "\(Int(value))"
     }
 }
 
@@ -2054,7 +2344,10 @@ struct DelayControlView: View {
                     ),
                     range: 0...2000,
                     step: 100,
-                    tickCount: 64
+                    tickCount: 64,
+                    tooltipFormatter: { v in
+                        v <= 0 ? "立即响应".localized : "\(Int(v)) ms"
+                    }
                 )
                 
                 ResetButton(title: "重置".localized) {
@@ -2144,7 +2437,8 @@ struct ToleranceControlView: View {
                     ),
                     range: Double(range.lowerBound)...Double(range.upperBound),
                     step: Double(step),
-                    tickCount: 24
+                    tickCount: 24,
+                    tooltipFormatter: { v in "\(Int(v)) px" }
                 )
                 
                 ResetButton(title: "重置".localized) {
@@ -3833,7 +4127,7 @@ struct ShortcutDisplayView: View {
 // MARK: - 关于设置页面
 struct AboutSettingsView: View {
     @Environment(\.colorScheme) var colorScheme
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.6"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.2.3"
 
     private var aboutHeaderIcon: NSImage? {
         let resourceName = colorScheme == .dark ? "AboutAppIconDark" : "AboutAppIconLight"
@@ -3918,6 +4212,20 @@ struct AboutSettingsView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundColor(.accentColor)
+
+                    Button(action: {
+                        if let url = URL(string: "https://ivean.com/donate/") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "heart.fill")
+                            Text("赞助".localized)
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
                 }
                 .padding(.top, 2)
             }
@@ -3942,6 +4250,12 @@ struct AboutSettingsView: View {
     
     private var recommendedToolsList: [RecommendedTool] {
         [
+            RecommendedTool(
+                name: "PathTrace",
+                slogan: "无需翻找，我知道你想保存在这里。".localized,
+                iconName: "pathtrace",
+                url: "https://ivean.com/pathtrace/"
+            ),
             RecommendedTool(
                 name: "EdgeClip",
                 slogan: "让刚刚复制的内容，留在手边。".localized,

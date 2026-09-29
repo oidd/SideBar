@@ -17,6 +17,13 @@ final class AccessibilityRuntimeGuard {
     private let cannotCompleteWindow: TimeInterval = 1.2
     private let cannotCompleteThreshold: Int = 18
     private let messagingTimeout: Float = 0.08
+    /// 已设置过 messaging timeout 的 element 集合。
+    /// 性能优化：configureMessagingTimeout 原本在每次 AX 调用（展开动画 60Hz）都
+    /// 调一次 AXUIElementSetMessagingTimeout。该系统调用对同一 element 设置相同
+    /// 值是幂等的，重复调用纯属浪费主线程时间。这里记录"已设过的 element"，只设一次。
+    /// element 由 WindowSession 强持有，本集合多持有一份引用不影响其生命周期。
+    private var timeoutConfiguredElements: Set<AXUIElement> = []
+    private let timeoutElementsLock = NSLock()
 
     private init() {}
 
@@ -61,7 +68,27 @@ final class AccessibilityRuntimeGuard {
 
     func configureMessagingTimeout(for element: AXUIElement) {
         guard isAccessibilityTrustedCached else { return }
+        // 性能优化：同一 element 的 messaging timeout 只设置一次。AXUIElementSetMessagingTimeout
+        // 是幂等的，重复调用只是无谓的系统调用开销。展开动画期间 WindowAnimator 以 60Hz
+        // 调 axSetPositionAttribute，原本每帧都会触发一次本方法，改为只设一次后可消除
+        // 这部分稳态系统调用负载。用锁保护集合，因为动画回调可能跨线程。
+        timeoutElementsLock.lock()
+        let alreadyConfigured = timeoutConfiguredElements.contains(element)
+        if !alreadyConfigured {
+            timeoutConfiguredElements.insert(element)
+        }
+        timeoutElementsLock.unlock()
+        guard !alreadyConfigured else { return }
         AXUIElementSetMessagingTimeout(element, messagingTimeout)
+    }
+
+    /// 从 messaging timeout 缓存中丢弃指定 element。
+    /// 用途：WindowSession 销毁 / 窗口 element 被替换时调用，避免 Set 长期驻留
+    /// 已经消亡的 AXUIElement 引用而造成缓慢内存泄漏。
+    func discardMessagingTimeoutCache(for element: AXUIElement) {
+        timeoutElementsLock.lock()
+        timeoutConfiguredElements.remove(element)
+        timeoutElementsLock.unlock()
     }
 
     func noteAXResult(_ result: AXError, context: String) {
@@ -117,6 +144,14 @@ final class AccessibilityRuntimeGuard {
             lastCannotCompleteAt = .distantPast
         }
         stateLock.unlock()
+
+        // 权限丢失/恢复转换时，清空 timeout 缓存集合：权限恢复后需要为每个 element
+        // 重新设置 messaging timeout（底层连接已重建，之前的设置不再生效）。
+        if previous != trusted {
+            timeoutElementsLock.lock()
+            timeoutConfiguredElements.removeAll()
+            timeoutElementsLock.unlock()
+        }
 
         guard previous != trusted else { return }
 

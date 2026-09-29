@@ -1,11 +1,19 @@
 import AppKit
 import CoreGraphics
 
+/// 承载置顶副本画面的悬浮面板。
+///
+/// 自身的唯一职责是把 `WindowMirrorLiveCapturer.renderingLayer` 挂到 contentView 的 layer 树上，
+/// 由 SCStream 直接推流，跨进程零拷贝渲染源窗口的实时画面。
+///
+/// 鼠标交互一律不走面板：`ignoresMouseEvents = true` 让点击、悬停、滚动、拖拽全部穿透到
+/// 真实窗口本身，于是用户在视觉上看到的是"置顶画面"，操作上仍直接作用在真实窗口上 ——
+/// 拖动标题栏、点击按钮、文本编辑、滚动列表都按真实窗口的原生行为进行。要解除置顶，
+/// 仍走原来的 `PinControlWindow` 图钉按钮入口。
+///
+/// 该窗口本体没有任何画面来源；不调用 `attachCaptureLayer(_:)` 时面板是空的。
 final class WindowMirrorOverlayWindow: NSPanel {
-    var onActivateRealWindow: (() -> Void)?
-    var hasSnapshot: Bool { snapshotView.image != nil }
-
-    private let snapshotView = MirrorSnapshotView()
+    private let mirrorView = MirrorLiveContentView()
 
     init() {
         super.init(
@@ -21,125 +29,86 @@ final class WindowMirrorOverlayWindow: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         hidesOnDeactivate = false
         isMovable = false
-        ignoresMouseEvents = false
-        contentView = snapshotView
-        snapshotView.onActivate = { [weak self] in
-            self?.onActivateRealWindow?()
-        }
+        // 关键：让所有鼠标事件穿透到下层真实窗口，置顶面板纯视觉。
+        ignoresMouseEvents = true
+        contentView = mirrorView
     }
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    func update(frame: CGRect, image: NSImage?, showImmediately: Bool = true) {
-        if let image {
-            snapshotView.image = image
-        }
-        setFrame(frame, display: true)
-        if showImmediately {
-            alphaValue = 1
-            orderFrontRegardless()
-        }
+    /// 把实时采集层挂到面板上。重复调用同一个 layer 是安全的。
+    func attachCaptureLayer(_ layer: CALayer) {
+        mirrorView.attachCaptureLayer(layer)
     }
 
-    func present() {
-        snapshotView.resetHoverActivation()
+    /// 从面板上摘掉采集层（不销毁 layer 本身），用于停掉采集时清理引用。
+    func detachCaptureLayer() {
+        mirrorView.detachCaptureLayer()
+    }
+
+    /// 显示面板并把 frame 同步为新的几何。
+    func display(at frame: CGRect) {
+        setFrame(frame, display: true)
         alphaValue = 1
         orderFrontRegardless()
     }
 
+    /// 仅更新 frame，不改变可见性。用于跟踪源窗口的位置变动。
+    func update(frame: CGRect) {
+        setFrame(frame, display: true)
+    }
+
+    /// 隐藏面板，但保留已挂载的采集层引用。
     func hide() {
-        snapshotView.resetHoverActivation()
         alphaValue = 1
         orderOut(nil)
     }
-
-    func suspendHoverActivation(for duration: TimeInterval) {
-        snapshotView.suspendHoverActivation(for: duration)
-    }
 }
 
-private final class MirrorSnapshotView: NSView {
-    var onActivate: (() -> Void)?
-    var image: NSImage? {
-        didSet { needsDisplay = true }
-    }
-    private var trackingAreaRef: NSTrackingArea?
-    private var hasTriggeredHoverActivation = false
-    private var isPointerInside = false
-    private var hoverActivationWorkItem: DispatchWorkItem?
-    private var hoverSuspendedUntil: Date = .distantPast
-    private let hoverActivationDelay: TimeInterval = 0.08
+/// 置顶面板的 contentView：宿主一个外部 CALayer（实际是 AVSampleBufferDisplayLayer）作为画面源。
+/// 不接管任何鼠标事件 —— 宿主面板已经把 `ignoresMouseEvents` 设为 true，事件根本不会派发到本视图。
+private final class MirrorLiveContentView: NSView {
+    private(set) var attachedCaptureLayer: CALayer?
 
-    override var isFlipped: Bool { true }
+    override var isFlipped: Bool { false }
 
-    func resetHoverActivation() {
-        hoverActivationWorkItem?.cancel()
-        hoverActivationWorkItem = nil
-        isPointerInside = false
-        hasTriggeredHoverActivation = false
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
-    func suspendHoverActivation(for duration: TimeInterval) {
-        hoverActivationWorkItem?.cancel()
-        hoverActivationWorkItem = nil
-        hoverSuspendedUntil = Date().addingTimeInterval(duration)
-        hasTriggeredHoverActivation = false
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingAreaRef {
-            removeTrackingArea(trackingAreaRef)
-        }
-        let trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea)
-        trackingAreaRef = trackingArea
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+    func attachCaptureLayer(_ newLayer: CALayer) {
+        guard let hostLayer = layer else { return }
+        if attachedCaptureLayer === newLayer {
+            newLayer.frame = hostLayer.bounds
             return
         }
-
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
-        context.saveGState()
-        context.interpolationQuality = .high
-        context.translateBy(x: 0, y: bounds.height)
-        context.scaleBy(x: 1, y: -1)
-        context.draw(cgImage, in: bounds)
-        context.restoreGState()
+        attachedCaptureLayer?.removeFromSuperlayer()
+        attachedCaptureLayer = newLayer
+        newLayer.frame = hostLayer.bounds
+        // autoresizingMask 让画面层自动跟随宿主 layer 的 bounds，避免缩放/移动时白边。
+        newLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        hostLayer.addSublayer(newLayer)
+        needsDisplay = true
     }
 
-    override func mouseEntered(with event: NSEvent) {
-        isPointerInside = true
-        guard !hasTriggeredHoverActivation, Date() >= hoverSuspendedUntil else { return }
-        hasTriggeredHoverActivation = true
-        hoverActivationWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.isPointerInside else { return }
-            self.onActivate?()
+    func detachCaptureLayer() {
+        attachedCaptureLayer?.removeFromSuperlayer()
+        attachedCaptureLayer = nil
+    }
+
+    override func layout() {
+        super.layout()
+        if let hostLayer = layer, let captureLayer = attachedCaptureLayer {
+            captureLayer.frame = hostLayer.bounds
         }
-        hoverActivationWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + hoverActivationDelay, execute: workItem)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isPointerInside = false
-        hoverActivationWorkItem?.cancel()
-        hoverActivationWorkItem = nil
-        hasTriggeredHoverActivation = false
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        hoverActivationWorkItem?.cancel()
-        hoverActivationWorkItem = nil
-        onActivate?()
     }
 }
