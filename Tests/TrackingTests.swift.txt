@@ -1,0 +1,158 @@
+var failures = 0
+var total = 0
+func expect(_ condition: Bool, _ name: String) {
+    total += 1
+    print("\(condition ? "PASS" : "FAIL") \(name)")
+    if !condition { failures += 1 }
+}
+func reset(edge: Int = 1) {
+    Clock.time = 0; Timer.all.removeAll(); DispatchQueue.blocks.removeAll()
+    NSEvent.pressedMouseButtons = 0
+    NSEvent.mouseLocation = CGPoint(x: edge == 1 ? 900 : 100, y: 700)
+    NSWorkspace.shared.frontmostApplication = nil
+}
+for edge in [1, 2] {
+    for dockClick in [false, true] {
+        reset(edge: edge)
+        let s = Session(edge: edge)
+        if dockClick {
+            s.pendingDockInteraction = true; s.hasReleasedDockClick = true
+            NSEvent.pressedMouseButtons = 1
+        } else { advance(1) } // begin the original 220ms outside grace period
+        s.rawFrameUnavailable = true
+        advance(dockClick ? 1 : 3)
+        let keptTracking = s.tracking && s.state == .expanded && s.collapseAnimations == 0 && s.focusReleases == 0
+        let hoveredDuringFailure = s.hover()
+        s.rawFrameUnavailable = false; NSEvent.pressedMouseButtons = 0
+        advance(12)
+        let recovered = s.snapped && !s.tracking && !s.isAnimating && s.collapseAnimations == 1 && s.focusReleases == 1
+        print("TRACE edge=\(edge) dockClick=\(dockClick) keptTracking=\(keptTracking) hoverDuringFailure=\(hoveredDuringFailure) recovered=\(recovered) state=\(s.state)")
+        expect(keptTracking && recovered, "read failure then recovery edge=\(edge) dockClick=\(dockClick)")
+        let revealAccepted = s.hover(); advance(4)
+        expect(recovered && revealAccepted && s.state == .expanded && s.tracking && s.alpha == 1, "hover works again edge=\(edge) dockClick=\(dockClick)")
+    }
+    reset(edge: edge)
+    let normal = Session(edge: edge)
+    advance(2)
+    expect(normal.state == .expanded && normal.collapseAnimations == 0, "normal outside grace preserved edge=\(edge)")
+    advance(8)
+    expect(normal.snapped && !normal.tracking && normal.collapseAnimations == 1 && normal.focusReleases == 1, "normal collapse once edge=\(edge)")
+}
+reset()
+let geometry = Session()
+geometry.geometryUnavailable = true
+advance(10)
+expect(geometry.tracking && geometry.state == .expanded && geometry.collapseAnimations == 0, "geometry preparation failure keeps tracking")
+geometry.geometryUnavailable = false
+advance(10)
+expect(geometry.snapped && geometry.collapseAnimations == 1, "geometry recovery uses the existing timer")
+
+reset()
+let persistent = Session()
+persistent.rawFrameUnavailable = true
+advance(100)
+expect(persistent.tracking && persistent.state == .expanded && persistent.collapseAnimations == 0 && persistent.focusReleases == 0, "persistent read failures do not animate or release focus")
+NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+persistent.rawFrameUnavailable = false
+advance(10)
+expect(persistent.state == .expanded && persistent.collapseAnimations == 0, "returning pointer cancels collapse naturally")
+NSEvent.mouseLocation = CGPoint(x: 900, y: 700)
+advance(10)
+expect(persistent.snapped && persistent.collapseAnimations == 1, "later pointer exit still collapses")
+
+for mode in ["pinned", "animating", "fusion", "mouse-down", "sibling", "dock-wait"] {
+    reset()
+    let s = Session()
+    switch mode {
+    case "pinned": s.isTemporarilyPinned = true
+    case "animating": s.isAnimating = true
+    case "fusion": s.fusionHoverLock = true
+    case "mouse-down": NSEvent.pressedMouseButtons = 1
+    case "sibling": s.siblingUnderMouse = true
+    default: s.pendingDockInteraction = true
+    }
+    advance(10)
+    expect(s.tracking && s.state == .expanded && s.collapseAnimations == 0, "existing guard preserved: \(mode)")
+}
+// A rejection from another caller must not remove an already-live timer.
+reset()
+let direct = Session(); direct.rawFrameUnavailable = true
+expect(!direct.directCollapse() && direct.tracking, "direct preparation rejection keeps tracking")
+
+// Reproduce the reported obscured-window case: the pointer remains inside the
+// source window's geometric bounds, but another regular app has taken focus.
+reset()
+let covered = Session()
+NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: covered.pid)
+advance(2) // populate the stationary-inside cache
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 456)
+advance(10)
+expect(covered.snapped && covered.collapseAnimations == 1 && covered.focusReleases == 0,
+       "other app focus bypasses cached inside geometry and collapses without restoring focus")
+let coveredRevealed = covered.hover(); advance(4)
+expect(coveredRevealed && covered.state == .expanded && covered.tracking,
+       "hover reveals again after switching to another app")
+
+reset()
+let waiting = Session()
+waiting.pendingDockInteraction = true; waiting.hasReleasedDockClick = true
+waiting.siblingUnderMouse = true
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 456)
+advance(10)
+expect(waiting.snapped && waiting.focusReleases == 0,
+       "new foreground app ends shortcut wait and ignores background sibling geometry")
+
+reset()
+let busy = Session()
+NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+busy.isAnimating = true
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 456)
+advance(3)
+expect(busy.collapseAnimations == 0, "focus switch does not interrupt current animation")
+busy.isAnimating = false
+advance(10)
+expect(busy.snapped && busy.focusReleases == 0, "focus switch is handled after animation finishes")
+
+for mode in ["pinned", "accessory", "same-app", "brief-switch"] {
+    reset()
+    let s = Session()
+    NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+    let other = NSRunningApplication(processIdentifier: mode == "same-app" ? s.pid : 456)!
+    if mode == "accessory" { other.activationPolicy = .accessory }
+    if mode == "pinned" { s.isTemporarilyPinned = true }
+    NSWorkspace.shared.frontmostApplication = other
+    if mode == "brief-switch" {
+        advance(2)
+        NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: s.pid)
+    }
+    advance(10)
+    expect(s.state == .expanded && s.collapseAnimations == 0, "foreground guard preserved: \(mode)")
+}
+
+reset()
+let focusReadFailure = Session()
+NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 456)
+focusReadFailure.rawFrameUnavailable = true
+advance(10)
+expect(focusReadFailure.tracking && focusReadFailure.collapseAnimations == 0 && focusReadFailure.focusReleases == 0,
+       "focus-loss preparation failure keeps tracking without changing selected app")
+focusReadFailure.rawFrameUnavailable = false
+advance(10)
+expect(focusReadFailure.snapped && focusReadFailure.focusReleases == 0,
+       "focus-loss collapse recovers when window reads resume")
+
+reset()
+let focusMouseDown = Session()
+NSEvent.mouseLocation = CGPoint(x: 100, y: 700)
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 456)
+NSEvent.pressedMouseButtons = 1
+advance(5)
+expect(focusMouseDown.collapseAnimations == 0, "focus-loss collapse waits for mouse release")
+NSEvent.pressedMouseButtons = 0
+advance(10)
+expect(focusMouseDown.snapped && focusMouseDown.focusReleases == 0, "focus-loss collapse runs after mouse release")
+
+print("RESULT checks=\(total) failures=\(failures)")
+exit(failures == 0 ? 0 : 1)

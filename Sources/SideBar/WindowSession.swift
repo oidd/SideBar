@@ -4146,7 +4146,9 @@ class WindowSession {
         let currentFrame = rawFrame
         
         guard let geometry = edgeGeometry(for: currentFrame) else { return false }
-        
+
+        // 准备失败时保留跟踪；只有接收收回操作后才停止，避免一次 AX 失败永久失联。
+        mouseTrackingTimer?.invalidate()
         state = .snapped(edge: currentEdge, hiddenOrX: geometry.hidden.x)
         notifyTemporaryShortcutStashStateChanged(isStashed: true)
         isAnimating = true
@@ -4428,6 +4430,12 @@ class WindowSession {
     }
     
     private func checkMouseForCollapse() {
+        // 切到其他普通应用后，窗口即使仍在鼠标所在矩形内，也可能已被遮挡。
+        // 不能沿用“鼠标还在窗内”的缓存或快捷键等待；按现有宽限期真正收回。
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let hasOtherForegroundApp = frontmostApp.map {
+            $0.processIdentifier != pid && $0.activationPolicy == .regular
+        } ?? false
         // 性能优化：展开稳态期间 mouseTrackingTimer 以 10Hz 触发本方法。若鼠标量化
         // 位置未变、AX 几何未抖动（observedGeometryChangeToken 未变）、且上次判定
         // 鼠标在窗口内（isOutside=false），则整轮（含 updatePinControlWindow 的 AX 读、
@@ -4441,7 +4449,8 @@ class WindowSession {
             y: (rawMouseLoc.y / Self.mouseCacheQuantum).rounded()
         )
         let geometryUnchanged = observedGeometryChangeToken == lastCheckedObservedGeometryToken
-        if let lastLoc = lastCheckedMouseLocation, lastLoc == quantizedMouse,
+        if !hasOtherForegroundApp,
+           let lastLoc = lastCheckedMouseLocation, lastLoc == quantizedMouse,
            geometryUnchanged, lastCheckedIsOutside == false {
             return
         }
@@ -4482,7 +4491,7 @@ class WindowSession {
         } else {
             pinSafeRectContainsMouse = false
         }
-        let isOutside = !bufferRect.contains(mappedMouseLoc) && !pinSafeRectContainsMouse
+        let isOutside = hasOtherForegroundApp || (!bufferRect.contains(mappedMouseLoc) && !pinSafeRectContainsMouse)
 
         // 回写"鼠标静止短路"缓存：记录本轮量化鼠标位置、isOutside、以及当前几何 token。
         // 下一轮若三者均未变化，即可在方法入口直接 return。
@@ -4503,7 +4512,7 @@ class WindowSession {
         // 鼠标还在窗口内（isOutside=false）时，`!isOutside` 已经导致早退，
         // 任何 sibling 值都不会改变结果。因此直接跳过枚举，把 10Hz × N 的
         // CGWindowList 全量扫描消掉，显著降低 mouseTrackingTimer 的基线 CPU。
-        let shouldQuerySiblingState = isOutside && !bypassSiblingGrace
+        let shouldQuerySiblingState = !hasOtherForegroundApp && isOutside && !bypassSiblingGrace
         let rawIsInsideSiblingWindow = shouldQuerySiblingState
             ? isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
             : false
@@ -4518,6 +4527,7 @@ class WindowSession {
             && isWithinSiblingWindowPostInteractionGrace(now)
 
 
+        if hasOtherForegroundApp { pendingDockInteraction = false }
         if pendingDockInteraction {
             if !isOutside {
                 pendingDockInteraction = false
@@ -4526,7 +4536,6 @@ class WindowSession {
                 if isPrimaryMouseDown {
                     if hasReleasedDockClick {
                         pendingDockInteraction = false
-                        mouseTrackingTimer?.invalidate()
                         if collapseWindow() {
                             // 点击外部触发折叠后，释放前台状态
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -4554,10 +4563,9 @@ class WindowSession {
 
         if let since = outsideCollapseCandidateSince,
            now.timeIntervalSince(since) >= Self.siblingWindowTransitionGraceInterval {
-            mouseTrackingTimer?.invalidate()
             if collapseWindow() {
-                // 鼠标移出折叠后释放前台状态，确保后续可通过 Dock 唤醒
-                scheduleFocusRelease(after: 0.35)
+                // 用户已选择另一个应用时保留其焦点；普通移出仍执行原有焦点归还。
+                if !hasOtherForegroundApp { scheduleFocusRelease(after: 0.35) }
             }
         } else if outsideCollapseCandidateSince == nil {
             outsideCollapseCandidateSince = now
