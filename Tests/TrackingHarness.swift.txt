@@ -1,0 +1,181 @@
+import Foundation
+import ApplicationServices
+
+// 全部平台操作只作用于内存；不创建 NSApplication、真实 AX element 或 display link。
+enum Clock { static var time = 0.0 }
+struct Date: Comparable {
+    let value: Double
+    init() { value = Clock.time }
+    init(_ value: Double) { self.value = value }
+    static let distantPast = Date(-1e10)
+    func timeIntervalSince(_ other: Date) -> Double { value - other.value }
+    static func < (lhs: Date, rhs: Date) -> Bool { lhs.value < rhs.value }
+}
+struct Deadline {
+    let value: Double
+    static func now() -> Deadline { Deadline(value: Clock.time) }
+    static func + (lhs: Deadline, rhs: Double) -> Deadline { Deadline(value: lhs.value + rhs) }
+}
+final class DispatchQueue {
+    static let main = DispatchQueue()
+    static var blocks: [(Double, () -> Void)] = []
+    func asyncAfter(deadline: Deadline, execute: @escaping () -> Void) { Self.blocks.append((deadline.value, execute)) }
+    static func drainDue() {
+        let due = blocks.filter { $0.0 <= Clock.time }
+        blocks.removeAll { $0.0 <= Clock.time }
+        due.forEach { $0.1() }
+    }
+}
+final class Timer {
+    static var all: [Timer] = []
+    var isValid = true
+    let interval: Double
+    var due: Double
+    let action: (Timer) -> Void
+    init(_ interval: Double, _ action: @escaping (Timer) -> Void) {
+        self.interval = interval; due = Clock.time + interval; self.action = action
+    }
+    static func scheduledTimer(withTimeInterval interval: Double, repeats: Bool, block: @escaping (Timer) -> Void) -> Timer {
+        precondition(repeats)
+        let timer = Timer(interval, block); all.append(timer); return timer
+    }
+    func invalidate() { isValid = false }
+    func tick() {
+        guard isValid, due <= Clock.time + 1e-9 else { return }
+        due = Clock.time + interval; action(self)
+    }
+}
+func advance(_ ticks: Int) {
+    for _ in 0..<ticks {
+        Clock.time += 0.1
+        DispatchQueue.drainDue()
+        Timer.all.forEach { $0.tick() }
+        DispatchQueue.drainDue()
+    }
+}
+enum NSEvent { static var mouseLocation = CGPoint(x: 900, y: 700); static var pressedMouseButtons = 0 }
+struct Color {}
+struct Screen { let frame = CGRect(x: 0, y: 0, width: 1000, height: 800) }
+enum SnapEdge { case left, right }
+final class AppConfig {
+    static let shared = AppConfig()
+    let hoverTolerance: CGFloat = 10
+    let hoverToleranceY: CGFloat = 10
+    func getColor(for bundleID: String) -> Color { Color() }
+}
+final class Window { var alphaValue: CGFloat = 1 }
+final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
+final class Animator { func stop() {} }
+final class AXUIElement { var size = CGSize(width: 400, height: 300) }
+struct ActivationOptions: OptionSet { let rawValue: Int; static let activateIgnoringOtherApps = ActivationOptions(rawValue: 1) }
+final class NSRunningApplication {
+    enum Policy { case regular, accessory, prohibited }
+    let processIdentifier: Int32
+    var activationPolicy = Policy.regular
+    init?(processIdentifier: Int32) { self.processIdentifier = processIdentifier }
+    @discardableResult func activate(options: ActivationOptions = []) -> Bool {
+        NSWorkspace.shared.frontmostApplication = self; return true
+    }
+}
+final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplication: NSRunningApplication? }
+@discardableResult func axSetSizeAttribute(on element: AXUIElement, size: CGSize, context: String) -> Bool { element.size = size; return true }
+@discardableResult func axSetBoolAttribute(on element: AXUIElement, attribute: CFString, value: Bool, context: String) -> Bool { true }
+struct Pins { let safeRect: CGRect }
+
+__SNAP_STATE__
+
+final class Session {
+    var state: SnapState = .expanded
+    var isAnimating = false { didSet { if isAnimating && !oldValue { animationGenerationToken += 1 } } }
+    var animationGenerationToken = 0
+    var mouseTrackingTimer: Timer?
+    var rawFrameUnavailable = false
+    var geometryUnavailable = false
+    var frame: CGRect
+    var rawReads = 0
+    var collapseAnimations = 0
+    var focusReleases = 0
+    var alpha: CGFloat = 1
+    var pendingDockInteraction = false
+    var hasReleasedDockClick = false
+    var isTemporarilyPinned = false
+    var fusionHoverLock = false
+    var siblingFocused = false
+    var siblingUnderMouse = false
+    var isIndicatorSuppressed = false
+    var isIndicatorAnimationAllowed = false
+    var queuedForwardedHotkeyToggle = false
+    var lastCollapseTime = Date.distantPast
+    var outsideCollapseCandidateSince: Date?
+    var edgeDetachCandidateSince: Date?
+    var lastSiblingWindowInteractionAt: Date?
+    var siblingGraceBypassUntil = Date.distantPast
+    static let siblingWindowTransitionGraceInterval = 0.22
+    static let mouseCacheQuantum: CGFloat = 1.5
+    var lastCheckedMouseLocation: CGPoint?
+    var lastCheckedIsOutside: Bool?
+    var observedGeometryChangeToken = 0
+    var lastCheckedObservedGeometryToken = 0
+    var cachedInteractionHitFrame: CGRect?
+    var cachedInteractionHitFrameAt = Date.distantPast
+    let primaryScreenHeight: CGFloat = 800
+    let bundleID = "test"
+    let pid: Int32 = 123
+    var currentEdge: Int
+    var lockedWidth: CGFloat = 400
+    let indicatorWindow = Window()
+    let effectWindow = Effect()
+    let windowAnimator = Animator()
+    let windowElement = AXUIElement()
+
+    init(edge: Int = 1) {
+        currentEdge = edge
+        frame = CGRect(x: edge == 1 ? 0 : 600, y: 0, width: 400, height: 300)
+        startMouseTrackingTimer()
+    }
+    var tracking: Bool { mouseTrackingTimer?.isValid == true }
+    var snapped: Bool { if case .snapped = state { return true }; return false }
+    func hover() -> Bool { expandWindow() }
+    func directCollapse() -> Bool { collapseWindow() }
+    func updatePinControlWindow() {}
+    func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool { false }
+    func interactionHitTestFrame() -> CGRect? { frame } // CG geometry remains readable while AX read fails.
+    func getRawWindowFrame() -> CGRect? { rawReads += 1; return rawFrameUnavailable ? nil : frame }
+    func getWindowFrame() -> CGRect? { getRawWindowFrame() }
+    func pinControlFrames(for frame: CGRect) -> Pins? { nil }
+    func isMouseInsideAnyVisibleSiblingWindow(_ point: CGPoint) -> Bool { siblingUnderMouse }
+    func hasFocusedSiblingWindowOfApp() -> Bool { siblingFocused }
+    func isWithinSiblingWindowPostInteractionGrace(_ now: Date) -> Bool { false }
+    func scheduleFocusRelease(after delay: Double) { focusReleases += 1 }
+    func excludeFromFocusReturn(for duration: Double) {}
+    func edgeGeometry(for frame: CGRect) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
+        guard !geometryUnavailable else { return nil }
+        let x: CGFloat = currentEdge == 1 ? 0 : 1000 - lockedWidth
+        let hiddenX: CGFloat = currentEdge == 1 ? -frame.width + 1 : 999
+        return (CGPoint(x: x, y: frame.minY), CGPoint(x: currentEdge == 1 ? -20400 : 21000, y: frame.minY), CGPoint(x: hiddenX, y: frame.minY))
+    }
+    func notifyTemporaryShortcutStashStateChanged(isStashed: Bool) {}
+    func getScreenForWindow() -> Screen { Screen() }
+    func collapsedWindowAlpha() -> Double { 0.01 }
+    func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) { self.alpha = alpha }
+    func setWindowPosition(position: CGPoint) { frame.origin = position; observedGeometryChangeToken += 1 }
+    func triggerCollapseEffect(edge: SnapEdge, point: CGPoint, color: Color) {}
+    func triggerExpandEffect(edge: SnapEdge, frame: CGRect, color: Color) {}
+    func showIndicator(animated: Bool = false) {}
+    func runQueuedForwardedHotkeyToggleIfNeeded() {}
+    func standardTransitionDuration() -> Double { 0.12 }
+    func invalidatePendingFocusRelease() {}
+    func rememberFocusReturnTargetBeforeReveal() {}
+    func beginTargetedActivationWindow(for duration: Double) {}
+    // Animator is unchanged by this patch. Model only its ordinary successful completion.
+    func animateWindowPositionFast(from startX: CGFloat, to endX: CGFloat, startY: CGFloat? = nil, endY: CGFloat? = nil, duration: Double, easeIn: Bool, enableSlowPositionCompensation: Bool = false, onStart: (() -> Void)? = nil, completion: @escaping () -> Void) {
+        if easeIn { collapseAnimations += 1 }
+        onStart?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            self.setWindowPosition(position: CGPoint(x: endX, y: endY ?? self.frame.minY))
+            completion()
+        }
+    }
+
+__METHODS__
+}

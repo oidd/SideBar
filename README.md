@@ -257,3 +257,11 @@ swiftc -typecheck Sources/SideBar/*.swift \
 3. 授予辅助功能权限。
 4. 在设置窗口中启用一个或多个常规 GUI 应用。
 5. 测试贴边吸附、悬停唤回、Dock 激活、快捷键以及多显示器行为。
+
+#### 悬停跟踪回归验证
+
+```bash
+Scripts/test-hover-tracking.sh
+```
+
+测试从当前 `WindowSession.swift` 原样提取展开、收回和鼠标跟踪方法，模拟前台应用切换和窗口读取故障，验证切换后能收回、读取失败后仍可恢复跟踪并再次悬停展开；平台操作均为内存后端，不启动 SideBar 或访问真实窗口。范围、基线复现与环境要求见 [验证说明](Tests/README.md)。
